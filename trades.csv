@@ -1,0 +1,2 @@
+timestamp,trade_id,market_id,market_question,side,entry_odds,fair_probability,edge,btc_price,bet_size,balance_before,balance_after,outcome,payout,profit_loss,mode
+2026-01-05T16:00:05.664159+00:00,T1767628805664,1105274,"Bitcoin Up or Down - January 5, 11:00AM-11:15AM ET",UP,0.4750,0.5200,0.0450,93966.64,3.00,100.00,103.25,WIN,6.25,3.25,TEST

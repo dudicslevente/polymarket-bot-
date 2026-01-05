@@ -1,0 +1,27 @@
+# Polymarket BTC 15-Minute Trading Bot - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# HTTP requests
+requests>=2.31.0
+
+# HTTP client with better features (used for Polymarket page scraping)
+httpx>=0.25.0
+
+# Optional but recommended for better async support
+# (not used in v1, but useful for future extensions)
+# aiohttp>=3.9.0
+
+# For Polymarket CLOB API interactions
+# (py-clob-client may have specific version requirements)
+# Uncomment if using official Polymarket SDK:
+# py-clob-client>=0.3.0
+
+# Optional: Web3 for direct blockchain interactions
+# (needed for advanced trading, not required for v1)
+# web3>=6.0.0
+
+# Optional: For better datetime handling
+# python-dateutil>=2.8.0

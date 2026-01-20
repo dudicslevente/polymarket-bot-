@@ -5,18 +5,26 @@ This module handles:
 - CSV trade logging with all required fields
 - Human-readable log formatting
 - Log file management
+- Performance analysis with plots
 
 All trades are logged for later analysis and performance tracking.
 """
 
 import csv
 import os
-from datetime import datetime
-from typing import Optional, Dict, Any
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 import config
 from execution import Trade
+from backtest.utils import BacktestTrade
+
+# Try to import plotting functions
+try:
+    from backtest.plots import plot_all, MATPLOTLIB_AVAILABLE
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 
 # CSV column headers for trade log
@@ -284,7 +292,87 @@ def log_trade(trade: Trade):
     get_logger().log_trade(trade)
 
 
+def load_trades_from_csv(filepath: str = "trades.csv") -> List[BacktestTrade]:
+    """
+    Load trades from CSV and convert them to BacktestTrade objects for plotting.
+    
+    Args:
+        filepath: Path to the trades CSV file
+    
+    Returns:
+        List of BacktestTrade objects
+    """
+    trades = []
+    
+    if not os.path.exists(filepath):
+        return trades
+    
+    with open(filepath, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                # Parse timestamp
+                timestamp_str = row.get("timestamp", "")
+                if timestamp_str:
+                    # Handle ISO format timestamp
+                    if "+" in timestamp_str or timestamp_str.endswith("Z"):
+                        entry_time = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    else:
+                        entry_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                        entry_time = entry_time.replace(tzinfo=timezone.utc)
+                else:
+                    continue
+                
+                # Create BacktestTrade object
+                trade = BacktestTrade(
+                    trade_id=row.get("trade_id", ""),
+                    interval_start=entry_time,  # Use entry time as interval start
+                    entry_time=entry_time,
+                    seconds_into_interval=0,
+                    market_id=row.get("market_id", ""),
+                    side=row.get("side", ""),
+                    entry_odds=float(row.get("entry_odds", 0)),
+                    fair_probability=float(row.get("fair_probability", 0)),
+                    edge=float(row.get("edge", 0)),
+                    btc_price_at_entry=float(row.get("btc_price", 0)),
+                    btc_price_at_close=float(row.get("btc_price", 0)),  # Not available, use entry price
+                    bet_size=float(row.get("bet_size", 0)),
+                    balance_before=float(row.get("balance_before", 0)),
+                    balance_after=float(row.get("balance_after", 0)),
+                    outcome=row.get("outcome", ""),
+                    payout=float(row.get("payout", 0)),
+                    profit_loss=float(row.get("profit_loss", 0)),
+                    resolved_outcome=row.get("outcome", ""),  # Use outcome as resolved
+                    mode=row.get("mode", "LIVE")
+                )
+                trades.append(trade)
+            except (ValueError, TypeError, KeyError) as e:
+                # Skip malformed rows
+                continue
+    
+    return trades
+
+
 def analyze_performance():
-    """Convenience function to print performance analysis."""
+    """Convenience function to print performance analysis with plots."""
     analyzer = PerformanceAnalyzer()
     analyzer.print_summary()
+    
+    # Generate plots if matplotlib is available
+    if MATPLOTLIB_AVAILABLE:
+        trades = load_trades_from_csv()
+        if trades:
+            print("📈 Generating performance plots...")
+            # Get starting balance from first trade
+            starting_balance = trades[0].balance_before if trades else 100.0
+            plot_all(
+                trades=trades,
+                starting_balance=starting_balance,
+                output_folder="analyze_plots",
+                show=False
+            )
+        else:
+            print("⚠️ No trades found for plotting.")
+    else:
+        print("⚠️ matplotlib not installed. Skipping plot generation.")
+        print("   Install with: pip install matplotlib")

@@ -57,38 +57,54 @@ class BinanceClient:
         # Binance allows 1200 requests per minute, we stay well below
         if len(self._api_calls) >= 60:
             sleep_time = 60 - (now - self._api_calls[0]) + 1
+            # Cap maximum wait time to 10 seconds
+            sleep_time = min(sleep_time, 10)
             if sleep_time > 0:
                 time.sleep(sleep_time)
         
         self._api_calls.append(time.time())
     
-    def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
+    def _make_request(self, endpoint: str, params: Optional[Dict] = None, retries: int = 2) -> Optional[Dict]:
         """
-        Make a GET request to Binance API with error handling.
+        Make a GET request to Binance API with error handling and retries.
         
         Returns None on error (never crashes).
         """
-        self._rate_limit_check()
+        last_error = None
         
-        url = f"{self.base_url}{endpoint}"
-        
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
+        for attempt in range(retries + 1):
+            self._rate_limit_check()
             
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Binance API timeout: {endpoint}")
-            return None
-        except requests.exceptions.ConnectionError:
-            print(f"⚠️ Binance connection error")
-            return None
-        except requests.exceptions.HTTPError as e:
-            print(f"⚠️ Binance HTTP error: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ Unexpected Binance API error: {e}")
-            return None
+            url = f"{self.base_url}{endpoint}"
+            
+            try:
+                # Reduced timeout from 10s to 5s
+                response = requests.get(url, params=params, timeout=5)
+                response.raise_for_status()
+                return response.json()
+                
+            except requests.exceptions.Timeout:
+                last_error = "timeout"
+                if attempt < retries:
+                    time.sleep(1)
+                    continue
+            except requests.exceptions.ConnectionError:
+                last_error = "connection"
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+            except requests.exceptions.HTTPError as e:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ Binance HTTP error: {e}")
+                return None
+            except Exception as e:
+                print(f"❌ Unexpected Binance API error: {e}")
+                return None
+        
+        # All retries exhausted
+        if last_error and config.VERBOSE_LOGGING:
+            print(f"⚠️ Binance API failed ({last_error}): {endpoint}")
+        return None
     
     def get_btc_price(self) -> Optional[float]:
         """

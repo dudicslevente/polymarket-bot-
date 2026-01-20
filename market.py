@@ -75,6 +75,8 @@ class PolymarketClient:
         if len(self._api_calls) >= config.MAX_API_CALLS_PER_MINUTE:
             # Wait until oldest call is more than 60 seconds old
             sleep_time = 60 - (now - self._api_calls[0]) + 1
+            # Cap maximum wait time to 10 seconds to prevent long stalls
+            sleep_time = min(sleep_time, 10)
             if sleep_time > 0:
                 print(f"⏳ Rate limit reached, waiting {sleep_time:.1f}s...")
                 time.sleep(sleep_time)
@@ -87,64 +89,81 @@ class PolymarketClient:
         url: str, 
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
-        authenticated: bool = False
+        authenticated: bool = False,
+        retries: int = 2
     ) -> Optional[Dict]:
         """
-        Make an HTTP request with error handling and rate limiting.
+        Make an HTTP request with error handling, rate limiting, and retries.
         
         Returns None on error (never crashes).
         """
-        self._rate_limit_check()
+        last_error = None
         
-        headers = {"Content-Type": "application/json"}
-        
-        # Add authentication headers if needed (for live trading)
-        if authenticated and self.api_key and self.api_secret:
-            timestamp = str(int(time.time() * 1000))
-            headers.update({
-                "POLY-API-KEY": self.api_key,
-                "POLY-TIMESTAMP": timestamp,
-                "POLY-PASSPHRASE": self.passphrase or "",
-            })
-            # Add signature if secret is available
-            if self.api_secret:
-                message = timestamp + method.upper() + url
-                if data:
-                    message += json.dumps(data)
-                signature = hmac.new(
-                    self.api_secret.encode(),
-                    message.encode(),
-                    hashlib.sha256
-                ).hexdigest()
-                headers["POLY-SIGNATURE"] = signature
-        
-        try:
-            if method.upper() == "GET":
-                response = requests.get(url, params=params, headers=headers, timeout=10)
-            elif method.upper() == "POST":
-                response = requests.post(url, json=data, headers=headers, timeout=10)
-            else:
-                print(f"❌ Unsupported HTTP method: {method}")
+        for attempt in range(retries + 1):
+            self._rate_limit_check()
+            
+            headers = {"Content-Type": "application/json"}
+            
+            # Add authentication headers if needed (for live trading)
+            if authenticated and self.api_key and self.api_secret:
+                timestamp = str(int(time.time() * 1000))
+                headers.update({
+                    "POLY-API-KEY": self.api_key,
+                    "POLY-TIMESTAMP": timestamp,
+                    "POLY-PASSPHRASE": self.passphrase or "",
+                })
+                # Add signature if secret is available
+                if self.api_secret:
+                    message = timestamp + method.upper() + url
+                    if data:
+                        message += json.dumps(data)
+                    signature = hmac.new(
+                        self.api_secret.encode(),
+                        message.encode(),
+                        hashlib.sha256
+                    ).hexdigest()
+                    headers["POLY-SIGNATURE"] = signature
+            
+            try:
+                # Reduced timeout from 10s to 5s for faster failure detection
+                timeout = 5
+                if method.upper() == "GET":
+                    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+                elif method.upper() == "POST":
+                    response = requests.post(url, json=data, headers=headers, timeout=timeout)
+                else:
+                    print(f"❌ Unsupported HTTP method: {method}")
+                    return None
+                
+                response.raise_for_status()
+                return response.json()
+                
+            except requests.exceptions.Timeout:
+                last_error = "timeout"
+                if attempt < retries:
+                    time.sleep(1)  # Brief wait before retry
+                    continue
+            except requests.exceptions.ConnectionError:
+                last_error = "connection"
+                if attempt < retries:
+                    time.sleep(2)  # Slightly longer wait for connection issues
+                    continue
+            except requests.exceptions.HTTPError as e:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ HTTP error {response.status_code}: {e}")
                 return None
-            
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Request timeout: {url}")
-            return None
-        except requests.exceptions.ConnectionError:
-            print(f"⚠️ Connection error: {url}")
-            return None
-        except requests.exceptions.HTTPError as e:
-            print(f"⚠️ HTTP error {response.status_code}: {e}")
-            return None
-        except json.JSONDecodeError:
-            print(f"⚠️ Invalid JSON response from: {url}")
-            return None
-        except Exception as e:
-            print(f"❌ Unexpected error in API request: {e}")
-            return None
+            except json.JSONDecodeError:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ Invalid JSON response from: {url}")
+                return None
+            except Exception as e:
+                print(f"❌ Unexpected error in API request: {e}")
+                return None
+        
+        # All retries exhausted
+        if last_error and config.VERBOSE_LOGGING:
+            print(f"⚠️ Request failed ({last_error}): {url}")
+        return None
     
     def fetch_btc_15min_markets(self) -> List[Market]:
         """
@@ -223,7 +242,7 @@ class PolymarketClient:
             resp = httpx.get(
                 page_url, 
                 headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
-                timeout=10,
+                timeout=5,  # Reduced from 10s to 5s
                 follow_redirects=True
             )
             resp.raise_for_status()

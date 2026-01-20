@@ -2,28 +2,9 @@
 
 A **conservative, production-ready** Python trading bot for Polymarket BTC 15-minute Up/Down prediction markets.
 
-## ⚠️ IMPORTANT LIMITATION
-
-**As of January 2026, Polymarket does NOT have 15-minute BTC up/down markets available.**
-
-Polymarket focuses on longer-term prediction markets (weeks/months/years), not short-term trading markets. The bot was designed for markets that currently don't exist on the platform.
-
-### What This Means
-
-- **Live trading**: The bot will find 0 markets to trade
-- **Strategy is sound**: The conservative approach would work well for short-term BTC trading
-- **Testing**: Use simulation mode to test the strategy logic
-
-### Recommended Usage
-
-1. **Test the strategy** using simulation mode
-2. **Monitor Polymarket** for future short-term BTC markets
-3. **Consider other platforms** that offer short-term crypto markets
-4. **Use as a framework** for building bots on other prediction markets
-
 ## 🧪 Testing the Strategy
 
-Since real 15-minute BTC markets don't exist, use simulation mode to test:
+Use simulation mode to test:
 
 ```bash
 # Run fast simulation (recommended)

@@ -52,3 +52,4 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+data/kaggle_data/*.csv

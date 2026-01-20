@@ -134,7 +134,10 @@ def run_trading_loop(
                             execution.force_resolve_trade_for_simulation(trade)
                             log_trade(trade)
                 else:
-                    execution.check_and_resolve_trades()
+                    # Live mode: resolve trades and log each one
+                    resolved_trades = execution.check_and_resolve_trades()
+                    for trade in resolved_trades:
+                        log_trade(trade)
             
             # ─────────────────────────────────────────────────────────────────
             # STEP 2: Check if we can trade (not in cooldown, have balance)

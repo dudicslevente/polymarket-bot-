@@ -64,8 +64,13 @@ class ExecutionState:
     Tracks the current state of the execution engine.
     
     Maintains virtual balance, active trades, and cooldown timers.
+    
+    Note: `logging_balance` is a separate balance tracker used for CSV logging.
+    It ensures that balance_before/balance_after form a consistent sequential chain,
+    even when multiple trades are active simultaneously.
     """
     balance: float = config.INITIAL_VIRTUAL_BALANCE
+    logging_balance: float = config.INITIAL_VIRTUAL_BALANCE  # For CSV consistency
     trades: List[Trade] = field(default_factory=list)
     active_trades: Dict[str, Trade] = field(default_factory=dict)
     last_trade_time: Optional[datetime] = None
@@ -89,11 +94,13 @@ class ExecutionEngine:
         # Load starting balance
         if config.TEST_MODE:
             self.state.balance = config.INITIAL_VIRTUAL_BALANCE
+            self.state.logging_balance = config.INITIAL_VIRTUAL_BALANCE
             print(f"💰 Starting virtual balance: ${self.state.balance:.2f}")
         else:
             # In live mode, would fetch real balance from wallet
             # For now, use initial as placeholder
             self.state.balance = config.INITIAL_VIRTUAL_BALANCE
+            self.state.logging_balance = config.INITIAL_VIRTUAL_BALANCE
     
     def is_in_cooldown(self) -> bool:
         """
@@ -161,13 +168,20 @@ class ExecutionEngine:
         # Create trade ID
         trade_id = f"T{int(time.time()*1000)}"
         
-        # Record balance before trade
-        balance_before = self.state.balance
+        # Record balance before trade (use logging_balance for CSV consistency)
+        balance_before = self.state.logging_balance
         
-        # Deduct bet from balance
+        # Deduct bet from both balances
         self.state.balance -= bet_size
+        self.state.logging_balance -= bet_size
+        
+        # Calculate expected balance_after at entry time for CSV chain consistency
+        # This is the LOSS scenario (balance_before - bet_size)
+        # Will be updated to include payout on WIN
+        expected_balance_after_loss = balance_before - bet_size
         
         # Create trade record
+        # Note: balance_after is set to loss scenario, will be updated on WIN
         trade = Trade(
             trade_id=trade_id,
             market_id=signal.market.market_id,
@@ -179,7 +193,7 @@ class ExecutionEngine:
             btc_price_at_entry=signal.btc_price,
             bet_size=bet_size,
             balance_before=balance_before,
-            balance_after=self.state.balance,  # Will be updated at resolution
+            balance_after=expected_balance_after_loss,  # Set at entry, updated on WIN
             status=TradeStatus.PENDING,
             entry_time=datetime.now(timezone.utc),
             mode="TEST" if config.TEST_MODE else "LIVE"
@@ -206,8 +220,9 @@ class ExecutionEngine:
             
             return trade
         else:
-            # Refund on failure
+            # Refund on failure - restore both balances
             self.state.balance = balance_before
+            self.state.logging_balance = balance_before
             trade.status = TradeStatus.FAILED
             print(f"❌ Trade execution failed")
             return None
@@ -242,32 +257,37 @@ class ExecutionEngine:
         
         return result is not None
     
-    def check_and_resolve_trades(self):
+    def check_and_resolve_trades(self) -> List[Trade]:
         """
         Check active trades and resolve any that have completed.
         
         In TEST_MODE: Simulates resolution based on the market's end time
         In LIVE mode: Would query Polymarket for actual resolution
+        
+        Returns:
+            List of resolved Trade objects (for logging)
         """
         now = datetime.now(timezone.utc)
         resolved_trades = []
-        
+
         for trade_id, trade in list(self.state.active_trades.items()):
             # Find the market for this trade
             # In a real implementation, we'd track the market end time
             # For simulation, we'll resolve after 15 minutes (900 seconds)
             
             time_since_entry = (now - trade.entry_time).total_seconds()
-            
+
             # Check if market should be resolved (15 min = 900 seconds)
             # Adding buffer for processing
             if time_since_entry >= 900:  # 15 minutes
                 self._resolve_trade(trade)
-                resolved_trades.append(trade_id)
+                resolved_trades.append(trade)
         
         # Remove resolved trades from active
-        for trade_id in resolved_trades:
-            del self.state.active_trades[trade_id]
+        for trade in resolved_trades:
+            del self.state.active_trades[trade.trade_id]
+        
+        return resolved_trades
     
     def _resolve_trade(self, trade: Trade):
         """
@@ -295,7 +315,17 @@ class ExecutionEngine:
             payout *= (1 - config.ESTIMATED_FEE_PERCENT)
             
             trade.payout = payout
+            
+            # Update actual balance (for bot's internal tracking)
             self.state.balance += payout
+            
+            # Update logging_balance with payout so next trade's balance_before is correct
+            self.state.logging_balance += payout
+            
+            # Update balance_after: calculate as balance_before - bet_size + payout
+            # This ensures each trade's balance_before/balance_after are self-consistent
+            trade.balance_after = trade.balance_before - trade.bet_size + payout
+            
             self.state.wins += 1
             
             profit = payout - trade.bet_size
@@ -307,9 +337,10 @@ class ExecutionEngine:
             trade.payout = 0.0
             self.state.losses += 1
             
+            # For LOSS, balance_after was already set correctly at entry time
+            # (balance_before - bet_size), no update needed
+            
             print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
-        
-        trade.balance_after = self.state.balance
     
     def _simulate_resolution(self, trade: Trade) -> str:
         """

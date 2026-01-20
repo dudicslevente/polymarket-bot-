@@ -10,6 +10,13 @@ requests>=2.31.0
 # HTTP client with better features (used for Polymarket page scraping)
 httpx>=0.25.0
 
+# Data analysis & manipulation (Required for backtesting)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Plotting (Optional, for backtest visualization)
+matplotlib>=3.7.0
+
 # Optional but recommended for better async support
 # (not used in v1, but useful for future extensions)
 # aiohttp>=3.9.0
@@ -21,7 +28,3 @@ httpx>=0.25.0
 
 # Optional: Web3 for direct blockchain interactions
 # (needed for advanced trading, not required for v1)
-# web3>=6.0.0
-
-# Optional: For better datetime handling
-# python-dateutil>=2.8.0

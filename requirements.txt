@@ -26,5 +26,11 @@ matplotlib>=3.7.0
 # Uncomment if using official Polymarket SDK:
 # py-clob-client>=0.3.0
 
-# Optional: Web3 for direct blockchain interactions
-# (needed for advanced trading, not required for v1)
+# ─────────────────────────────────────────────────────────────────────────────────
+# LIVE TRADING DEPENDENCIES (Required for TEST_MODE=false)
+# ─────────────────────────────────────────────────────────────────────────────────
+# Ethereum account management and signing
+eth-account>=0.10.0
+
+# Web3 library for blockchain interactions
+web3>=6.0.0

@@ -220,7 +220,10 @@ def analyze_trade_opportunity(
         signal.btc_change_percent = change_percent
     
     if bias is None:
-        signal.skip_reason = f"No clear BTC bias (change: {change_percent:.3f}% within ±{config.BTC_BIAS_THRESHOLD_PERCENT}%)"
+        if change_percent is None:
+            signal.skip_reason = "Could not calculate BTC price change"
+        else:
+            signal.skip_reason = f"No clear BTC bias (change: {change_percent:.3f}% within ±{config.BTC_BIAS_THRESHOLD_PERCENT}%)"
         return signal
     
     signal.side = bias  # "UP" or "DOWN"

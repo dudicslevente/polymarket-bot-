@@ -56,6 +56,11 @@ class Trade:
     outcome: Optional[str] = None  # "WIN" or "LOSS"
     payout: float = 0.0
     mode: str = "TEST"
+    # LIVE mode fields
+    order_id: Optional[str] = None  # Polymarket order ID
+    order_status: Optional[str] = None  # Order status from CLOB
+    filled_price: Optional[float] = None  # Actual fill price
+    filled_shares: Optional[float] = None  # Actual shares filled
 
 
 @dataclass
@@ -77,6 +82,23 @@ class ExecutionState:
     total_trades: int = 0
     wins: int = 0
     losses: int = 0
+    
+    # Daily tracking (resets at midnight UTC)
+    daily_starting_balance: float = config.INITIAL_VIRTUAL_BALANCE
+    daily_trades: int = 0
+    daily_wins: int = 0
+    daily_losses: int = 0
+    daily_pnl: float = 0.0
+    daily_reset_date: Optional[datetime] = None
+    
+    # Streak tracking
+    consecutive_losses: int = 0
+    consecutive_wins: int = 0
+    
+    # Safety limits
+    trading_paused: bool = False
+    pause_reason: Optional[str] = None
+    pause_until: Optional[datetime] = None
 
 
 class ExecutionEngine:
@@ -91,17 +113,88 @@ class ExecutionEngine:
         self.polymarket = polymarket_client
         self.state = ExecutionState()
         
+        # Initialize daily tracking
+        now = datetime.now(timezone.utc)
+        self.state.daily_reset_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
         # Load starting balance
         if config.TEST_MODE:
             self.state.balance = config.INITIAL_VIRTUAL_BALANCE
             self.state.logging_balance = config.INITIAL_VIRTUAL_BALANCE
+            self.state.daily_starting_balance = config.INITIAL_VIRTUAL_BALANCE
             print(f"💰 Starting virtual balance: ${self.state.balance:.2f}")
         else:
-            # In live mode, would fetch real balance from wallet
-            # For now, use initial as placeholder
-            self.state.balance = config.INITIAL_VIRTUAL_BALANCE
-            self.state.logging_balance = config.INITIAL_VIRTUAL_BALANCE
+            # In LIVE mode, fetch real balance from Polymarket
+            self._initialize_live_balance()
     
+    def _initialize_live_balance(self):
+        """
+        Initialize balance from Polymarket in LIVE mode.
+        
+        Fetches real USDC balance and validates it meets minimum requirements.
+        Raises RuntimeError if balance cannot be fetched or is too low.
+        """
+        print("💰 Fetching live balance from Polymarket...")
+        
+        real_balance = self.polymarket.get_usdc_balance()
+        
+        if real_balance is None:
+            raise RuntimeError(
+                "❌ Could not fetch wallet balance from Polymarket.\n"
+                "   Please check:\n"
+                "   1. Your API credentials are correct\n"
+                "   2. Your wallet is connected to Polymarket\n"
+                "   3. You have internet connectivity"
+            )
+        
+        if real_balance < config.MIN_BALANCE_TO_TRADE:
+            raise RuntimeError(
+                f"❌ Insufficient balance for trading.\n"
+                f"   Current balance: ${real_balance:.2f}\n"
+                f"   Minimum required: ${config.MIN_BALANCE_TO_TRADE:.2f}\n"
+                f"   Please deposit more USDC to your Polymarket account."
+            )
+        
+        self.state.balance = real_balance
+        self.state.logging_balance = real_balance
+        self.state.daily_starting_balance = real_balance
+        
+        print(f"✅ Live wallet balance: ${real_balance:.2f}")
+    
+    def refresh_balance(self) -> bool:
+        """
+        Refresh the balance from Polymarket.
+        
+        Useful to sync balance after trades or to verify funds are still available.
+        
+        Returns:
+            True if balance was refreshed successfully, False otherwise
+        """
+        if config.TEST_MODE:
+            # In test mode, balance is managed internally
+            return True
+        
+        new_balance = self.polymarket.get_usdc_balance()
+        
+        if new_balance is None:
+            print("⚠️ Could not refresh balance from API")
+            return False
+        
+        old_balance = self.state.balance
+        self.state.balance = new_balance
+        
+        # Only update logging_balance if no active trades
+        # (active trades will update it upon resolution)
+        if not self.state.active_trades:
+            self.state.logging_balance = new_balance
+        
+        if config.VERBOSE_LOGGING:
+            diff = new_balance - old_balance
+            if abs(diff) > 0.01:
+                print(f"💰 Balance updated: ${old_balance:.2f} → ${new_balance:.2f} ({diff:+.2f})")
+        
+        return True
+
     def is_in_cooldown(self) -> bool:
         """
         Check if we're in cooldown period between trades.
@@ -128,9 +221,34 @@ class ExecutionEngine:
         Check if we can execute a trade of the given size.
         
         Checks:
-        1. Balance is sufficient
-        2. Not in cooldown
+        1. Trading not paused (safety limits)
+        2. Daily reset check
+        3. Balance is sufficient
+        4. Not in cooldown
+        5. Daily loss limit not exceeded
+        6. Consecutive loss limit not exceeded
+        7. Daily trade limit not exceeded
         """
+        # Check if trading is paused
+        if self.state.trading_paused:
+            if self.state.pause_until:
+                now = datetime.now(timezone.utc)
+                if now >= self.state.pause_until:
+                    # Pause expired, resume trading
+                    self._resume_trading()
+                else:
+                    remaining = (self.state.pause_until - now).total_seconds()
+                    print(f"⛔ Trading paused: {self.state.pause_reason}")
+                    print(f"   Resumes in {remaining/60:.0f} minutes")
+                    return False
+            else:
+                print(f"⛔ Trading paused: {self.state.pause_reason}")
+                return False
+        
+        # Check for daily reset (midnight UTC)
+        self._check_daily_reset()
+        
+        # Check balance
         if self.state.balance < config.MIN_BALANCE_TO_TRADE:
             print(f"❌ Balance too low: ${self.state.balance:.2f} < ${config.MIN_BALANCE_TO_TRADE:.2f}")
             return False
@@ -139,10 +257,174 @@ class ExecutionEngine:
             print(f"❌ Bet size ${bet_size:.2f} exceeds balance ${self.state.balance:.2f}")
             return False
         
+        # Check cooldown
         if self.is_in_cooldown():
             return False
         
+        # Check daily loss limit
+        if not self._check_daily_loss_limit():
+            return False
+        
+        # Check consecutive losses
+        if not self._check_consecutive_losses():
+            return False
+        
+        # Check daily trade limit
+        if not self._check_daily_trade_limit():
+            return False
+        
         return True
+    
+    def _check_daily_reset(self):
+        """
+        Check if we've crossed midnight UTC and reset daily counters.
+        """
+        now = datetime.now(timezone.utc)
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        if self.state.daily_reset_date is None or self.state.daily_reset_date < today:
+            # New day - reset daily counters
+            if self.state.daily_reset_date is not None:
+                print(f"📅 New day detected - resetting daily counters")
+                print(f"   Yesterday: {self.state.daily_trades} trades, "
+                      f"PnL: ${self.state.daily_pnl:+.2f}")
+            
+            self.state.daily_reset_date = today
+            self.state.daily_starting_balance = self.state.balance
+            self.state.daily_trades = 0
+            self.state.daily_wins = 0
+            self.state.daily_losses = 0
+            self.state.daily_pnl = 0.0
+            
+            # Resume trading if paused for daily limit
+            if self.state.trading_paused and "daily" in (self.state.pause_reason or "").lower():
+                self._resume_trading()
+    
+    def _check_daily_loss_limit(self) -> bool:
+        """
+        Check if daily loss limit has been exceeded.
+        
+        Returns:
+            True if we can trade, False if limit exceeded
+        """
+        # Calculate current daily loss
+        daily_loss = -self.state.daily_pnl if self.state.daily_pnl < 0 else 0
+        
+        # Check percentage-based limit
+        if config.DAILY_LOSS_LIMIT_PERCENT > 0:
+            max_loss = self.state.daily_starting_balance * config.DAILY_LOSS_LIMIT_PERCENT
+            if daily_loss >= max_loss:
+                self._pause_trading(
+                    f"Daily loss limit ({config.DAILY_LOSS_LIMIT_PERCENT*100:.0f}%) exceeded: "
+                    f"${daily_loss:.2f} >= ${max_loss:.2f}",
+                    cooldown_seconds=config.LOSS_LIMIT_COOLDOWN_SECONDS
+                )
+                return False
+        
+        # Check absolute USD limit
+        if config.DAILY_LOSS_LIMIT_USD > 0:
+            if daily_loss >= config.DAILY_LOSS_LIMIT_USD:
+                self._pause_trading(
+                    f"Daily loss limit exceeded: ${daily_loss:.2f} >= ${config.DAILY_LOSS_LIMIT_USD:.2f}",
+                    cooldown_seconds=config.LOSS_LIMIT_COOLDOWN_SECONDS
+                )
+                return False
+        
+        return True
+    
+    def _check_consecutive_losses(self) -> bool:
+        """
+        Check if we've hit the consecutive loss limit.
+        
+        Returns:
+            True if we can trade, False if limit exceeded
+        """
+        if config.MAX_CONSECUTIVE_LOSSES <= 0:
+            return True  # Disabled
+        
+        if self.state.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+            self._pause_trading(
+                f"Consecutive loss limit ({config.MAX_CONSECUTIVE_LOSSES}) reached",
+                cooldown_seconds=config.LOSS_LIMIT_COOLDOWN_SECONDS
+            )
+            return False
+        
+        return True
+    
+    def _check_daily_trade_limit(self) -> bool:
+        """
+        Check if we've hit the daily trade limit.
+        
+        Returns:
+            True if we can trade, False if limit exceeded
+        """
+        if config.MAX_TRADES_PER_DAY <= 0:
+            return True  # Disabled
+        
+        if self.state.daily_trades >= config.MAX_TRADES_PER_DAY:
+            print(f"⚠️ Daily trade limit reached: {self.state.daily_trades} >= {config.MAX_TRADES_PER_DAY}")
+            return False
+        
+        return True
+    
+    def _pause_trading(self, reason: str, cooldown_seconds: int = 0):
+        """
+        Pause trading with a reason and optional cooldown.
+        
+        Args:
+            reason: Why trading was paused
+            cooldown_seconds: How long to pause (0 = until manual resume or daily reset)
+        """
+        self.state.trading_paused = True
+        self.state.pause_reason = reason
+        
+        if cooldown_seconds > 0:
+            self.state.pause_until = datetime.now(timezone.utc) + \
+                                     __import__('datetime').timedelta(seconds=cooldown_seconds)
+            print(f"⛔ TRADING PAUSED: {reason}")
+            print(f"   Will auto-resume in {cooldown_seconds/60:.0f} minutes")
+        else:
+            self.state.pause_until = None
+            print(f"⛔ TRADING PAUSED: {reason}")
+            print(f"   Will resume at next daily reset (midnight UTC)")
+    
+    def _resume_trading(self):
+        """
+        Resume trading after a pause.
+        """
+        if self.state.trading_paused:
+            print(f"✅ Trading resumed (was paused: {self.state.pause_reason})")
+        
+        self.state.trading_paused = False
+        self.state.pause_reason = None
+        self.state.pause_until = None
+    
+    def get_daily_stats(self) -> Dict:
+        """
+        Get current daily trading statistics.
+        
+        Returns:
+            Dict with daily stats
+        """
+        self._check_daily_reset()
+        
+        return {
+            "date": self.state.daily_reset_date,
+            "starting_balance": self.state.daily_starting_balance,
+            "current_balance": self.state.balance,
+            "daily_pnl": self.state.daily_pnl,
+            "daily_pnl_percent": (self.state.daily_pnl / self.state.daily_starting_balance * 100) 
+                                 if self.state.daily_starting_balance > 0 else 0,
+            "trades": self.state.daily_trades,
+            "wins": self.state.daily_wins,
+            "losses": self.state.daily_losses,
+            "win_rate": (self.state.daily_wins / self.state.daily_trades * 100) 
+                        if self.state.daily_trades > 0 else 0,
+            "consecutive_losses": self.state.consecutive_losses,
+            "consecutive_wins": self.state.consecutive_wins,
+            "trading_paused": self.state.trading_paused,
+            "pause_reason": self.state.pause_reason,
+        }
     
     def execute_trade(
         self,
@@ -169,19 +451,20 @@ class ExecutionEngine:
         trade_id = f"T{int(time.time()*1000)}"
         
         # Record balance before trade (use logging_balance for CSV consistency)
-        balance_before = self.state.logging_balance
+        # logging_balance represents the balance after all RESOLVED trades
+        # It is NOT modified at entry, only at resolution
+        balance_before_logging = self.state.logging_balance
         
-        # Deduct bet from both balances
+        # Store actual balance before deduction for restoration on failure
+        actual_balance_before = self.state.balance
+        
+        # Deduct bet from actual trading balance only (not logging_balance)
+        # logging_balance is only updated when trades RESOLVE, not when they're placed
+        # This ensures correct balance_before even when trades overlap
         self.state.balance -= bet_size
-        self.state.logging_balance -= bet_size
-        
-        # Calculate expected balance_after at entry time for CSV chain consistency
-        # This is the LOSS scenario (balance_before - bet_size)
-        # Will be updated to include payout on WIN
-        expected_balance_after_loss = balance_before - bet_size
         
         # Create trade record
-        # Note: balance_after is set to loss scenario, will be updated on WIN
+        # balance_after will be calculated at resolution time
         trade = Trade(
             trade_id=trade_id,
             market_id=signal.market.market_id,
@@ -192,8 +475,8 @@ class ExecutionEngine:
             edge=signal.edge,
             btc_price_at_entry=signal.btc_price,
             bet_size=bet_size,
-            balance_before=balance_before,
-            balance_after=expected_balance_after_loss,  # Set at entry, updated on WIN
+            balance_before=balance_before_logging,
+            balance_after=0.0,  # Will be set at resolution time
             status=TradeStatus.PENDING,
             entry_time=datetime.now(timezone.utc),
             mode="TEST" if config.TEST_MODE else "LIVE"
@@ -216,15 +499,15 @@ class ExecutionEngine:
             self.polymarket.mark_as_traded(signal.market)
             
             print(f"✅ Trade executed: {trade.side} ${bet_size:.2f} @ {trade.entry_odds:.3f}")
-            print(f"   Balance: ${balance_before:.2f} → ${self.state.balance:.2f}")
+            print(f"   Balance: ${balance_before_logging:.2f} → ${self.state.balance:.2f}")
             
             return trade
         else:
-            # Refund on failure - restore both balances
-            self.state.balance = balance_before
-            self.state.logging_balance = balance_before
+            # Refund on failure - restore actual balance (not logging_balance)
+            # logging_balance was never modified, so no need to restore it
+            self.state.balance = actual_balance_before
             trade.status = TradeStatus.FAILED
-            print(f"❌ Trade execution failed")
+            print(f"❌ Trade execution failed - balance restored to ${actual_balance_before:.2f}")
             return None
     
     def _simulate_execution(self, trade: Trade) -> bool:
@@ -242,50 +525,169 @@ class ExecutionEngine:
         """
         Execute a live trade on Polymarket.
         
-        Returns True if order was placed successfully.
-        """
-        # Determine which side to buy
-        # For "UP" bias, we buy the "yes" token
-        # For "DOWN" bias, we buy the "no" token
-        polymarket_side = "yes" if trade.side == "UP" else "no"
+        This method:
+        1. Determines the correct side to buy
+        2. Places the order via the CLOB API
+        3. Waits for order to be filled
+        4. Stores order information in the trade object
+        5. Returns success/failure status
         
+        Args:
+            trade: The Trade object to execute
+            signal: The TradeSignal with market information
+            
+        Returns:
+            True if order was filled, False otherwise
+        """
+        # Determine which side to buy based on our prediction
+        # For BTC 15-min markets:
+        #   - "UP" prediction = buy the "up" token
+        #   - "DOWN" prediction = buy the "down" token
+        # 
+        # Note: BTC markets use "up"/"down", not "yes"/"no"
+        polymarket_side = trade.side.lower()  # "up" or "down"
+        
+        # Place the order
         result = self.polymarket.place_order(
             market=signal.market,
             side=polymarket_side,
-            amount_usd=trade.bet_size
+            amount_usd=trade.bet_size,
+            max_slippage_percent=2.0  # 2% max slippage
         )
         
-        return result is not None
+        if result is None:
+            print("❌ Order placement returned None")
+            return False
+        
+        # Check if order was accepted
+        if not result.get("success", False):
+            error = result.get("error", "Unknown error")
+            print(f"❌ Order rejected: {error}")
+            return False
+        
+        order_id = result.get("order_id")
+        trade.order_id = order_id
+        
+        if config.VERBOSE_LOGGING:
+            print(f"📋 Order placed: {order_id}")
+            print(f"   Waiting for fill confirmation...")
+        
+        # Wait for order to be filled
+        fill_result = self.polymarket.wait_for_order_fill(
+            order_id=order_id,
+            max_wait_seconds=config.ORDER_FILL_TIMEOUT if hasattr(config, 'ORDER_FILL_TIMEOUT') else 60,
+            poll_interval=2.0
+        )
+        
+        if not fill_result["success"]:
+            # Order was not filled - handle failure
+            error_msg = fill_result.get("error", "Unknown")
+            trade.order_status = fill_result["status"]
+            
+            if fill_result["status"] == "TIMEOUT":
+                # Try to cancel the unfilled order
+                print(f"⚠️ Order fill timeout, attempting to cancel...")
+                cancelled = self.polymarket.cancel_order(order_id)
+                if cancelled:
+                    print("✅ Unfilled order cancelled")
+                else:
+                    print("⚠️ Could not cancel order - may have filled")
+                    # Re-check status
+                    final_check = self.polymarket.get_order_status(order_id)
+                    if final_check:
+                        status = self.polymarket._parse_order_status(final_check)
+                        if status in ["FILLED", "MATCHED"]:
+                            # Actually it filled!
+                            fill_info = self.polymarket._extract_fill_info(final_check)
+                            trade.order_status = status
+                            trade.filled_price = fill_info["filled_price"]
+                            trade.filled_shares = fill_info["filled_shares"]
+                            trade.entry_odds = trade.filled_price or trade.entry_odds
+                            print(f"✅ Order actually filled: {trade.filled_shares:.2f} shares @ ${trade.filled_price:.4f}")
+                            return True
+            
+            print(f"❌ Order not filled: {error_msg}")
+            return False
+        
+        # Order was filled successfully
+        trade.order_status = fill_result["status"]
+        trade.filled_price = fill_result["filled_price"]
+        trade.filled_shares = fill_result["filled_shares"]
+        
+        # Update entry odds with actual fill price
+        if trade.filled_price and trade.filled_price > 0:
+            old_odds = trade.entry_odds
+            trade.entry_odds = trade.filled_price
+            if config.VERBOSE_LOGGING and old_odds != trade.filled_price:
+                print(f"   Fill price adjusted: {old_odds:.4f} → {trade.filled_price:.4f}")
+        
+        if config.VERBOSE_LOGGING:
+            print(f"✅ Order filled successfully:")
+            print(f"   Order ID: {trade.order_id}")
+            print(f"   Status: {trade.order_status}")
+            print(f"   Shares: {trade.filled_shares:.4f}")
+            print(f"   Price: ${trade.filled_price:.4f}")
+        
+        return True
     
     def check_and_resolve_trades(self) -> List[Trade]:
         """
         Check active trades and resolve any that have completed.
         
         In TEST_MODE: Simulates resolution based on the market's end time
-        In LIVE mode: Would query Polymarket for actual resolution
+        In LIVE mode: Queries Polymarket for actual resolution
         
         Returns:
             List of resolved Trade objects (for logging)
         """
         now = datetime.now(timezone.utc)
         resolved_trades = []
+        pending_trades = []
 
         for trade_id, trade in list(self.state.active_trades.items()):
-            # Find the market for this trade
-            # In a real implementation, we'd track the market end time
-            # For simulation, we'll resolve after 15 minutes (900 seconds)
-            
             time_since_entry = (now - trade.entry_time).total_seconds()
 
-            # Check if market should be resolved (15 min = 900 seconds)
-            # Adding buffer for processing
-            if time_since_entry >= 900:  # 15 minutes
-                self._resolve_trade(trade)
-                resolved_trades.append(trade)
+            # Only check resolution after market should have ended
+            # 15 min = 900 seconds + 60 seconds buffer for resolution propagation
+            if time_since_entry >= 960:  # 16 minutes
+                if config.TEST_MODE:
+                    # In test mode, resolve immediately
+                    self._resolve_trade(trade)
+                    resolved_trades.append(trade)
+                else:
+                    # In LIVE mode, try to get actual resolution
+                    outcome = self._get_live_resolution(trade)
+                    
+                    if outcome == "PENDING":
+                        # Still pending - track for retry
+                        pending_trades.append(trade)
+                        
+                        # If it's been way too long (>30 min), force resolution
+                        if time_since_entry > 1800:  # 30 minutes
+                            print(f"⚠️ Trade {trade.trade_id} pending too long, forcing resolution check...")
+                            # Try one more aggressive check
+                            outcome = self._force_resolution_check(trade)
+                            if outcome != "PENDING":
+                                self._resolve_trade_with_outcome(trade, outcome)
+                                resolved_trades.append(trade)
+                            else:
+                                # Really can't determine - mark as unknown loss
+                                print(f"❌ Could not determine resolution for {trade.trade_id} after 30min")
+                                self._resolve_trade_with_outcome(trade, "UNKNOWN")
+                                resolved_trades.append(trade)
+                    else:
+                        # Got a definitive resolution
+                        self._resolve_trade_with_outcome(trade, outcome)
+                        resolved_trades.append(trade)
+        
+        # Log pending trades count
+        if pending_trades and config.VERBOSE_LOGGING:
+            print(f"⏳ {len(pending_trades)} trades still pending resolution...")
         
         # Remove resolved trades from active
         for trade in resolved_trades:
-            del self.state.active_trades[trade.trade_id]
+            if trade.trade_id in self.state.active_trades:
+                del self.state.active_trades[trade.trade_id]
         
         return resolved_trades
     
@@ -295,6 +697,11 @@ class ExecutionEngine:
         
         In TEST_MODE: Simulates win/loss probabilistically
         In LIVE mode: Would get actual resolution from Polymarket
+        
+        Also updates:
+        - Daily PnL tracking
+        - Win/loss streaks
+        - Daily trade counters
         """
         if config.TEST_MODE:
             outcome = self._simulate_resolution(trade)
@@ -319,28 +726,56 @@ class ExecutionEngine:
             # Update actual balance (for bot's internal tracking)
             self.state.balance += payout
             
-            # Update logging_balance with payout so next trade's balance_before is correct
-            self.state.logging_balance += payout
+            # Update logging_balance: deduct bet and add payout
+            # This maintains the sequential chain for CSV logging
+            self.state.logging_balance = self.state.logging_balance - trade.bet_size + payout
             
-            # Update balance_after: calculate as balance_before - bet_size + payout
-            # This ensures each trade's balance_before/balance_after are self-consistent
-            trade.balance_after = trade.balance_before - trade.bet_size + payout
+            # Set balance_after based on the new logging_balance
+            trade.balance_after = self.state.logging_balance
             
             self.state.wins += 1
             
+            # Update daily stats
             profit = payout - trade.bet_size
+            self.state.daily_wins += 1
+            self.state.daily_pnl += profit
+            
+            # Update streaks
+            self.state.consecutive_wins += 1
+            self.state.consecutive_losses = 0
+            
             print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.balance:.2f}")
             
         else:
             trade.outcome = "LOSS"
             trade.status = TradeStatus.RESOLVED_LOSS
             trade.payout = 0.0
+            
+            # Update logging_balance: deduct bet (no payout)
+            self.state.logging_balance = self.state.logging_balance - trade.bet_size
+            
+            # Set balance_after based on the new logging_balance
+            trade.balance_after = self.state.logging_balance
+            
             self.state.losses += 1
             
-            # For LOSS, balance_after was already set correctly at entry time
-            # (balance_before - bet_size), no update needed
+            # Update daily stats
+            self.state.daily_losses += 1
+            self.state.daily_pnl -= trade.bet_size
+            
+            # Update streaks
+            self.state.consecutive_losses += 1
+            self.state.consecutive_wins = 0
             
             print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
+            
+            # Check if we should pause (will be evaluated on next can_trade call)
+            if config.MAX_CONSECUTIVE_LOSSES > 0:
+                if self.state.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+                    print(f"⚠️ {self.state.consecutive_losses} consecutive losses - trading will pause")
+        
+        # Update daily trade counter
+        self.state.daily_trades += 1
     
     def _simulate_resolution(self, trade: Trade) -> str:
         """
@@ -372,19 +807,158 @@ class ExecutionEngine:
     
     def _get_live_resolution(self, trade: Trade) -> str:
         """
-        Get actual resolution from Polymarket in LIVE mode.
+        Get actual resolution from Polymarket in LIVE mode (NON-BLOCKING).
         
-        This would query the market for its resolution.
-        For now, returns "UNKNOWN" - needs real API integration.
+        This queries the Polymarket API to determine if the market
+        has resolved and whether our position won or lost.
+        
+        Args:
+            trade: The trade to check resolution for
+            
+        Returns:
+            "WIN", "LOSS", or "PENDING"
         """
-        # In a real implementation:
-        # 1. Query Polymarket API for market resolution
-        # 2. Check if our position won or lost
-        # 3. Return "WIN" or "LOSS"
+        if config.VERBOSE_LOGGING:
+            print(f"🔍 Checking resolution for trade {trade.trade_id}...")
         
-        # Placeholder - would need actual API call
-        print("⚠️ Live resolution check not fully implemented")
-        return "LOSS"  # Conservative default
+        # Use the market client to check resolution
+        # Use short timeout - we don't want to block the main loop
+        outcome = self.polymarket.check_trade_resolution(
+            market_id=trade.market_id,
+            traded_side=trade.side,
+            max_wait_seconds=10  # Short non-blocking check
+        )
+        
+        if outcome == "PENDING":
+            # Resolution not available yet - don't default to loss!
+            # The calling code will handle pending trades
+            if config.VERBOSE_LOGGING:
+                print(f"⏳ Resolution pending for {trade.trade_id}")
+            return "PENDING"
+        
+        return outcome
+    
+    def _force_resolution_check(self, trade: Trade) -> str:
+        """
+        Force a more aggressive resolution check for stuck trades.
+        
+        Tries multiple methods to determine the outcome.
+        
+        Args:
+            trade: The trade to check
+            
+        Returns:
+            "WIN", "LOSS", or "PENDING"
+        """
+        print(f"🔄 Force checking resolution for {trade.trade_id}...")
+        
+        # Try with longer timeout
+        outcome = self.polymarket.check_trade_resolution(
+            market_id=trade.market_id,
+            traded_side=trade.side,
+            max_wait_seconds=30  # Longer wait for forced check
+        )
+        
+        if outcome != "PENDING":
+            return outcome
+        
+        # Try checking via different API endpoint (if available)
+        # This is a fallback for when the main resolution API is slow
+        try:
+            market_info = self.polymarket.get_market_by_id(trade.market_id)
+            if market_info:
+                resolved = market_info.get("resolved", False)
+                if resolved:
+                    resolution_source = market_info.get("resolution_source", "")
+                    outcome_value = market_info.get("outcome", "")
+                    
+                    # Determine if our side won
+                    our_side = trade.side.upper()
+                    winning_side = outcome_value.upper() if outcome_value else ""
+                    
+                    if winning_side and our_side == winning_side:
+                        return "WIN"
+                    elif winning_side:
+                        return "LOSS"
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Fallback resolution check failed: {e}")
+        
+        return "PENDING"
+    
+    def _resolve_trade_with_outcome(self, trade: Trade, outcome: str):
+        """
+        Resolve a trade with a known outcome.
+        
+        Similar to _resolve_trade but uses a provided outcome instead
+        of determining it.
+        
+        Args:
+            trade: The trade to resolve
+            outcome: "WIN", "LOSS", or "UNKNOWN"
+        """
+        trade.resolution_time = datetime.now(timezone.utc)
+        
+        if outcome == "WIN":
+            trade.outcome = "WIN"
+            trade.status = TradeStatus.RESOLVED_WIN
+            
+            # Calculate payout
+            payout = trade.bet_size / trade.entry_odds
+            payout *= (1 - config.ESTIMATED_FEE_PERCENT)
+            trade.payout = payout
+            
+            # Update balances
+            self.state.balance += payout
+            self.state.logging_balance = self.state.logging_balance - trade.bet_size + payout
+            trade.balance_after = self.state.logging_balance
+            
+            self.state.wins += 1
+            profit = payout - trade.bet_size
+            self.state.daily_wins += 1
+            self.state.daily_pnl += profit
+            self.state.consecutive_wins += 1
+            self.state.consecutive_losses = 0
+            
+            print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.balance:.2f}")
+            
+        elif outcome == "LOSS":
+            trade.outcome = "LOSS"
+            trade.status = TradeStatus.RESOLVED_LOSS
+            trade.payout = 0.0
+            
+            self.state.logging_balance = self.state.logging_balance - trade.bet_size
+            trade.balance_after = self.state.logging_balance
+            
+            self.state.losses += 1
+            self.state.daily_losses += 1
+            self.state.daily_pnl -= trade.bet_size
+            self.state.consecutive_losses += 1
+            self.state.consecutive_wins = 0
+            
+            print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
+            
+            if config.MAX_CONSECUTIVE_LOSSES > 0:
+                if self.state.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+                    print(f"⚠️ {self.state.consecutive_losses} consecutive losses - trading will pause")
+                    
+        else:  # UNKNOWN
+            # Treat unknown as loss for accounting safety
+            trade.outcome = "UNKNOWN"
+            trade.status = TradeStatus.RESOLVED_LOSS
+            trade.payout = 0.0
+            
+            self.state.logging_balance = self.state.logging_balance - trade.bet_size
+            trade.balance_after = self.state.logging_balance
+            
+            self.state.losses += 1
+            self.state.daily_losses += 1
+            self.state.daily_pnl -= trade.bet_size
+            
+            print(f"❓ UNKNOWN: {trade.side} | Assuming loss: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
+        
+        # Update daily trade counter
+        self.state.daily_trades += 1
     
     def force_resolve_trade_for_simulation(self, trade: Trade, minutes_passed: float = 15.0):
         """

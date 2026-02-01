@@ -3,7 +3,7 @@ Main orchestration module for the Polymarket BTC 15-minute trading bot.
 
 This is the entry point for the bot. It:
 - Validates configuration
-- Initializes all components
+- Initializes all components (including authentication for LIVE mode)
 - Runs the main trading loop
 - Handles graceful shutdown
 
@@ -28,6 +28,7 @@ from strategy import (
 )
 from execution import ExecutionEngine, confirm_live_trading
 from logger import get_logger, log_trade, analyze_performance
+from auth import validate_live_auth, get_auth
 
 
 # Global flag for graceful shutdown
@@ -72,8 +73,14 @@ def initialize_bot():
     # Print config summary
     config.print_config_summary()
     
-    # In LIVE mode, require confirmation
+    # In LIVE mode, validate authentication credentials
     if not config.TEST_MODE:
+        print("\n🔐 Validating authentication for LIVE trading...")
+        if not validate_live_auth():
+            print("❌ Authentication validation failed. Cannot proceed with LIVE trading.")
+            return False
+        
+        # Require manual confirmation for live trading
         if not confirm_live_trading():
             return False
     

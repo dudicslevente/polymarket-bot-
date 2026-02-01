@@ -127,6 +127,34 @@ MIN_BALANCE_TO_TRADE: float = float(os.getenv("MIN_BALANCE_TO_TRADE", "10.0"))
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# SAFETY LIMITS (LIVE MODE)
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Daily loss limit as percentage of starting daily balance
+# Why: Prevents catastrophic losses in a single day due to strategy failure or tilt
+# Set to 0 to disable daily loss limit
+DAILY_LOSS_LIMIT_PERCENT: float = float(os.getenv("DAILY_LOSS_LIMIT_PERCENT", "0.20"))  # 20%
+
+# Daily loss limit as absolute USD amount (applies if > 0)
+# Use this instead of percentage for fixed dollar limits
+# Set to 0 to use percentage-based limit only
+DAILY_LOSS_LIMIT_USD: float = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0.0"))  # Disabled by default
+
+# Maximum consecutive losses before pausing trading
+# Why: Losing streaks may indicate strategy issues or unusual market conditions
+# Set to 0 to disable
+MAX_CONSECUTIVE_LOSSES: int = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))
+
+# Cooldown period after hitting loss limit (in seconds)
+# During this period, no new trades will be placed
+LOSS_LIMIT_COOLDOWN_SECONDS: int = int(os.getenv("LOSS_LIMIT_COOLDOWN_SECONDS", "3600"))  # 1 hour
+
+# Maximum trades per day (set to 0 to disable)
+# Why: Prevents overtrading and excessive fees
+MAX_TRADES_PER_DAY: int = int(os.getenv("MAX_TRADES_PER_DAY", "100"))
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # TIMING & RATE LIMITS
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -152,6 +180,23 @@ ESTIMATED_FEE_PERCENT: float = float(os.getenv("ESTIMATED_FEE_PERCENT", "0.01"))
 
 # Estimated slippage on market orders
 ESTIMATED_SLIPPAGE_PERCENT: float = float(os.getenv("ESTIMATED_SLIPPAGE_PERCENT", "0.005"))  # 0.5%
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ORDER EXECUTION (LIVE MODE)
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Maximum time to wait for an order to fill (in seconds)
+# Why 60s: BTC 15-min markets are time-sensitive, can't wait forever
+ORDER_FILL_TIMEOUT: int = int(os.getenv("ORDER_FILL_TIMEOUT", "60"))
+
+# Maximum slippage allowed when placing orders (as decimal)
+# Why 2%: Allow some slippage for fills, but reject if price moves too much
+MAX_ORDER_SLIPPAGE: float = float(os.getenv("MAX_ORDER_SLIPPAGE", "0.02"))  # 2%
+
+# Whether to cancel unfilled orders after timeout
+# Why True: Don't leave stale orders that might fill unexpectedly later
+CANCEL_UNFILLED_ORDERS: bool = os.getenv("CANCEL_UNFILLED_ORDERS", "true").lower() == "true"
 
 
 # ────────────────────────────────────────────────────────────────────────────────

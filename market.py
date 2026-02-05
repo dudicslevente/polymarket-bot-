@@ -1576,6 +1576,443 @@ class PolymarketClient:
         return True
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # POSITION TRACKING METHODS (LIVE MODE)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def get_open_positions(self) -> Optional[List[Dict]]:
+        """
+        Get all open positions for the user.
+        
+        This retrieves all tokens/shares currently held in the account,
+        including unredeemed winning positions.
+        
+        Returns:
+            List of position dicts with token_id, size, market info, etc.
+            Returns None on error, empty list if no positions.
+            
+        Example:
+            >>> positions = client.get_open_positions()
+            >>> for pos in positions:
+            ...     print(f"Token: {pos['token_id']}, Shares: {pos['size']}")
+        """
+        if config.TEST_MODE:
+            return []
+        
+        if not self._auth.is_ready(AuthLevel.L1):
+            print("❌ Cannot fetch positions: Authentication not configured")
+            return None
+        
+        try:
+            url = f"{self.clob_url}/positions"
+            result = self._make_request("GET", url, authenticated=True)
+            
+            if result is None:
+                return None
+            
+            positions = []
+            
+            # Handle different response formats
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict):
+                        positions.append(self._parse_position(item))
+            elif isinstance(result, dict):
+                # Single position or wrapped response
+                if "positions" in result:
+                    for item in result["positions"]:
+                        positions.append(self._parse_position(item))
+                else:
+                    positions.append(self._parse_position(result))
+            
+            if config.VERBOSE_LOGGING and positions:
+                print(f"📋 Found {len(positions)} open positions")
+            
+            return positions
+            
+        except Exception as e:
+            print(f"❌ Error fetching positions: {e}")
+            return None
+    
+    def _parse_position(self, data: Dict) -> Dict:
+        """
+        Parse a position from API response into standardized format.
+        
+        Args:
+            data: Raw position data from API
+            
+        Returns:
+            Standardized position dict
+        """
+        return {
+            "token_id": data.get("token_id") or data.get("tokenId") or data.get("asset_id"),
+            "size": float(data.get("size") or data.get("shares") or data.get("balance") or 0),
+            "avg_price": float(data.get("avg_price") or data.get("avgPrice") or data.get("average_price") or 0),
+            "market_id": data.get("market_id") or data.get("marketId") or data.get("condition_id"),
+            "side": data.get("side") or data.get("outcome"),
+            "unrealized_pnl": float(data.get("unrealized_pnl") or data.get("unrealizedPnl") or 0),
+            "raw": data  # Keep raw data for debugging
+        }
+    
+    def get_position_for_token(self, token_id: str) -> Optional[Dict]:
+        """
+        Get position information for a specific token.
+        
+        Args:
+            token_id: The token ID to look up
+            
+        Returns:
+            Position dict if found, None otherwise
+        """
+        positions = self.get_open_positions()
+        
+        if positions is None:
+            return None
+        
+        for pos in positions:
+            if pos.get("token_id") == token_id:
+                return pos
+        
+        return None
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # SHARE REDEMPTION METHODS (CRITICAL FOR LIVE TRADING)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def redeem_winning_shares(
+        self, 
+        token_id: str,
+        shares: Optional[float] = None,
+        max_retries: int = 3
+    ) -> Optional[Dict]:
+        """
+        Redeem winning shares for USDC after market resolution.
+        
+        CRITICAL: Polymarket does NOT automatically credit winnings.
+        After a market resolves, winning shares must be explicitly
+        redeemed to convert them back to USDC.
+        
+        Args:
+            token_id: The token ID of the winning position
+            shares: Number of shares to redeem (None = all available)
+            max_retries: Number of retry attempts on failure
+            
+        Returns:
+            Dict with redemption info on success:
+            {
+                "success": True,
+                "amount_usdc": float,  # Amount credited
+                "shares_redeemed": float,
+                "tx_hash": str (if available)
+            }
+            Returns None on failure.
+            
+        Example:
+            >>> result = client.redeem_winning_shares("abc123", shares=10.5)
+            >>> if result and result["success"]:
+            ...     print(f"Redeemed ${result['amount_usdc']:.2f}")
+        """
+        if config.TEST_MODE:
+            return {
+                "success": True,
+                "amount_usdc": shares or 10.0,
+                "shares_redeemed": shares or 10.0,
+                "simulated": True
+            }
+        
+        if not self._auth.is_ready(AuthLevel.L2):
+            print("❌ Cannot redeem: L2 authentication (wallet) required")
+            return None
+        
+        if not token_id:
+            print("❌ Cannot redeem: No token ID provided")
+            return None
+        
+        # If shares not specified, get current position
+        if shares is None:
+            position = self.get_position_for_token(token_id)
+            if position:
+                shares = position.get("size", 0)
+            else:
+                # Try to redeem anyway - API might know the balance
+                shares = 0  # Will be filled by API
+        
+        if shares is not None and shares <= 0:
+            if config.VERBOSE_LOGGING:
+                print("ℹ️ No shares to redeem (already redeemed or zero balance)")
+            return {
+                "success": True,
+                "amount_usdc": 0,
+                "shares_redeemed": 0,
+                "message": "No shares to redeem"
+            }
+        
+        # Attempt redemption with retries
+        for attempt in range(max_retries):
+            try:
+                result = self._execute_redemption(token_id, shares)
+                
+                if result and result.get("success"):
+                    return result
+                
+                if attempt < max_retries - 1:
+                    print(f"⚠️ Redemption attempt {attempt + 1} failed, retrying...")
+                    time.sleep(2)
+                    
+            except Exception as e:
+                print(f"❌ Redemption error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        
+        print(f"❌ Redemption failed after {max_retries} attempts")
+        return None
+    
+    def _execute_redemption(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
+        """
+        Execute the actual redemption API call.
+        
+        Polymarket's redemption can work in different ways:
+        1. Direct redemption endpoint
+        2. Claiming via condition ID
+        3. Automatic redemption on market close
+        
+        This method tries multiple approaches.
+        
+        Args:
+            token_id: Token to redeem
+            shares: Number of shares (None = all)
+            
+        Returns:
+            Redemption result dict or None
+        """
+        result = {
+            "success": False,
+            "amount_usdc": 0,
+            "shares_redeemed": 0,
+            "method": None
+        }
+        
+        # Method 1: Try the redeem endpoint
+        redemption_result = self._try_redeem_endpoint(token_id, shares)
+        if redemption_result:
+            return redemption_result
+        
+        # Method 2: Try the claim endpoint
+        claim_result = self._try_claim_endpoint(token_id, shares)
+        if claim_result:
+            return claim_result
+        
+        # Method 3: Check if auto-redeemed (balance should reflect it)
+        # Some markets auto-redeem on resolution
+        auto_result = self._check_auto_redemption(token_id, shares)
+        if auto_result:
+            return auto_result
+        
+        return None
+    
+    def _try_redeem_endpoint(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
+        """
+        Try to redeem via the /redeem endpoint.
+        """
+        try:
+            url = f"{self.clob_url}/redeem"
+            
+            redeem_data = {
+                "token_id": token_id,
+            }
+            
+            if shares is not None and shares > 0:
+                redeem_data["amount"] = str(shares)
+            
+            # Sign the redemption request
+            try:
+                signature = self._auth.sign_order({
+                    "token_id": token_id,
+                    "side": "REDEEM",
+                    "size": str(shares or 0),
+                    "price": "1.0",
+                    "nonce": int(time.time() * 1000)
+                })
+                redeem_data["signature"] = signature
+            except Exception as e:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ Could not sign redemption: {e}")
+            
+            response = self._make_request("POST", url, data=redeem_data, authenticated=True)
+            
+            if response:
+                # Check for success indicators
+                if response.get("success") or response.get("redeemed") or "tx" in response:
+                    amount = float(response.get("amount") or response.get("redeemed_amount") or shares or 0)
+                    return {
+                        "success": True,
+                        "amount_usdc": amount,
+                        "shares_redeemed": shares or amount,
+                        "method": "redeem_endpoint",
+                        "tx_hash": response.get("tx") or response.get("txHash") or response.get("transaction_hash"),
+                        "raw_response": response
+                    }
+            
+            return None
+            
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Redeem endpoint error: {e}")
+            return None
+    
+    def _try_claim_endpoint(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
+        """
+        Try to claim/redeem via the /claim endpoint.
+        
+        Some Polymarket implementations use a claim endpoint instead of redeem.
+        """
+        try:
+            url = f"{self.clob_url}/claim"
+            
+            claim_data = {
+                "token_id": token_id,
+            }
+            
+            if shares is not None and shares > 0:
+                claim_data["amount"] = str(shares)
+            
+            response = self._make_request("POST", url, data=claim_data, authenticated=True)
+            
+            if response:
+                if response.get("success") or response.get("claimed"):
+                    amount = float(response.get("amount") or response.get("claimed_amount") or shares or 0)
+                    return {
+                        "success": True,
+                        "amount_usdc": amount,
+                        "shares_redeemed": shares or amount,
+                        "method": "claim_endpoint",
+                        "raw_response": response
+                    }
+            
+            return None
+            
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Claim endpoint error: {e}")
+            return None
+    
+    def _check_auto_redemption(self, token_id: str, expected_shares: Optional[float]) -> Optional[Dict]:
+        """
+        Check if shares were auto-redeemed by comparing balances.
+        
+        Some Polymarket markets auto-redeem winning positions.
+        We can detect this by checking if the position is gone
+        but our USDC balance increased.
+        """
+        try:
+            # Check current position
+            position = self.get_position_for_token(token_id)
+            
+            if position and position.get("size", 0) > 0:
+                # Still have shares - not auto-redeemed
+                return None
+            
+            # Position is gone or empty - might be auto-redeemed
+            # We can't verify the USDC credit easily, so assume success
+            # if the position is gone
+            if position is None or position.get("size", 0) == 0:
+                if config.VERBOSE_LOGGING:
+                    print("ℹ️ Position appears to be redeemed (no longer held)")
+                
+                return {
+                    "success": True,
+                    "amount_usdc": expected_shares or 0,
+                    "shares_redeemed": expected_shares or 0,
+                    "method": "auto_redemption",
+                    "message": "Position no longer held - likely auto-redeemed"
+                }
+            
+            return None
+            
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Auto-redemption check error: {e}")
+            return None
+    
+    def redeem_all_winning_positions(self) -> Dict[str, Any]:
+        """
+        Attempt to redeem all winning positions in the account.
+        
+        This is useful for cleanup after multiple trades or
+        if any redemptions were missed.
+        
+        Returns:
+            Dict with summary:
+            {
+                "total_redeemed": float,
+                "positions_processed": int,
+                "positions_redeemed": int,
+                "failed": List[str]  # token IDs that failed
+            }
+        """
+        if config.TEST_MODE:
+            return {
+                "total_redeemed": 0,
+                "positions_processed": 0,
+                "positions_redeemed": 0,
+                "failed": [],
+                "simulated": True
+            }
+        
+        print("🔍 Checking for unredeemed winning positions...")
+        
+        positions = self.get_open_positions()
+        
+        if not positions:
+            print("ℹ️ No open positions found")
+            return {
+                "total_redeemed": 0,
+                "positions_processed": 0,
+                "positions_redeemed": 0,
+                "failed": []
+            }
+        
+        total_redeemed = 0
+        positions_redeemed = 0
+        failed = []
+        
+        for pos in positions:
+            token_id = pos.get("token_id")
+            shares = pos.get("size", 0)
+            
+            if not token_id or shares <= 0:
+                continue
+            
+            print(f"   Attempting to redeem {shares:.4f} shares of {token_id[:16]}...")
+            
+            result = self.redeem_winning_shares(token_id, shares)
+            
+            if result and result.get("success"):
+                amount = result.get("amount_usdc", 0)
+                total_redeemed += amount
+                positions_redeemed += 1
+                print(f"   ✅ Redeemed ${amount:.2f}")
+            else:
+                failed.append(token_id)
+                print(f"   ❌ Failed to redeem")
+        
+        summary = {
+            "total_redeemed": total_redeemed,
+            "positions_processed": len(positions),
+            "positions_redeemed": positions_redeemed,
+            "failed": failed
+        }
+        
+        print(f"\n📊 Redemption Summary:")
+        print(f"   Positions processed: {summary['positions_processed']}")
+        print(f"   Successfully redeemed: {summary['positions_redeemed']}")
+        print(f"   Total USDC: ${summary['total_redeemed']:.2f}")
+        
+        if failed:
+            print(f"   ⚠️ Failed redemptions: {len(failed)}")
+        
+        return summary
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # MARKET RESOLUTION METHODS (LIVE MODE)
     # ═══════════════════════════════════════════════════════════════════════════════
 

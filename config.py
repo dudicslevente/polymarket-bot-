@@ -198,6 +198,10 @@ MAX_ORDER_SLIPPAGE: float = float(os.getenv("MAX_ORDER_SLIPPAGE", "0.02"))  # 2%
 # Why True: Don't leave stale orders that might fill unexpectedly later
 CANCEL_UNFILLED_ORDERS: bool = os.getenv("CANCEL_UNFILLED_ORDERS", "true").lower() == "true"
 
+# Interval for checking and redeeming winning positions (in seconds)
+# This is a safety net to ensure no winning shares are left unredeemed
+REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "300"))  # 5 minutes
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING

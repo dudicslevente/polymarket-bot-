@@ -109,9 +109,12 @@ def run_trading_loop(
     
     logger = get_logger()
     scan_count = 0
+    last_redemption_check = time.time()
     
     print("\n🚀 Starting trading loop...")
     print(f"   Scanning every {config.SCAN_INTERVAL_SECONDS} seconds")
+    if not config.TEST_MODE:
+        print(f"   Redemption check every {config.REDEMPTION_CHECK_INTERVAL} seconds")
     print(f"   Press Ctrl+C to stop\n")
     
     while not _shutdown_requested:
@@ -225,6 +228,16 @@ def run_trading_loop(
             # ─────────────────────────────────────────────────────────────────
             if scan_count % 10 == 0:
                 execution.print_stats()
+            
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 6.5: Periodic redemption check (LIVE mode only)
+            # ─────────────────────────────────────────────────────────────────
+            if not config.TEST_MODE:
+                current_time_epoch = time.time()
+                if current_time_epoch - last_redemption_check >= config.REDEMPTION_CHECK_INTERVAL:
+                    # Check for unredeemed winning positions
+                    execution.check_and_redeem_positions()
+                    last_redemption_check = current_time_epoch
             
             # ─────────────────────────────────────────────────────────────────
             # STEP 7: Sleep until next scan

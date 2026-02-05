@@ -61,6 +61,11 @@ class Trade:
     order_status: Optional[str] = None  # Order status from CLOB
     filled_price: Optional[float] = None  # Actual fill price
     filled_shares: Optional[float] = None  # Actual shares filled
+    # Token tracking for redemption (CRITICAL for LIVE mode)
+    token_id: Optional[str] = None  # Token ID we bought - needed for redemption
+    condition_id: Optional[str] = None  # Market condition ID for resolution
+    redemption_status: Optional[str] = None  # "PENDING", "REDEEMED", "FAILED"
+    redemption_amount: Optional[float] = None  # Amount redeemed in USDC
 
 
 @dataclass
@@ -527,10 +532,12 @@ class ExecutionEngine:
         
         This method:
         1. Determines the correct side to buy
-        2. Places the order via the CLOB API
-        3. Waits for order to be filled
-        4. Stores order information in the trade object
-        5. Returns success/failure status
+        2. Stores token ID for later redemption
+        3. Places the order via the CLOB API
+        4. Waits for order to be filled
+        5. Stores order information in the trade object
+        6. Syncs balance after execution
+        7. Returns success/failure status
         
         Args:
             trade: The Trade object to execute
@@ -546,6 +553,23 @@ class ExecutionEngine:
         # 
         # Note: BTC markets use "up"/"down", not "yes"/"no"
         polymarket_side = trade.side.lower()  # "up" or "down"
+        
+        # CRITICAL: Store token ID and condition ID for later redemption
+        if hasattr(signal.market, 'tokens') and signal.market.tokens:
+            trade.token_id = signal.market.tokens.get(polymarket_side)
+            if not trade.token_id:
+                print(f"❌ No token ID found for side: {polymarket_side}")
+                print(f"   Available tokens: {list(signal.market.tokens.keys())}")
+                return False
+        else:
+            print("❌ Market has no token information - cannot execute LIVE trade")
+            return False
+        
+        # Store condition ID for resolution checking
+        trade.condition_id = signal.market.condition_id
+        
+        if config.VERBOSE_LOGGING:
+            print(f"📋 Token ID stored for redemption: {trade.token_id[:16]}...")
         
         # Place the order
         result = self.polymarket.place_order(
@@ -604,6 +628,8 @@ class ExecutionEngine:
                             trade.filled_shares = fill_info["filled_shares"]
                             trade.entry_odds = trade.filled_price or trade.entry_odds
                             print(f"✅ Order actually filled: {trade.filled_shares:.2f} shares @ ${trade.filled_price:.4f}")
+                            # Sync balance after successful trade
+                            self._sync_balance_after_trade()
                             return True
             
             print(f"❌ Order not filled: {error_msg}")
@@ -627,8 +653,33 @@ class ExecutionEngine:
             print(f"   Status: {trade.order_status}")
             print(f"   Shares: {trade.filled_shares:.4f}")
             print(f"   Price: ${trade.filled_price:.4f}")
+            print(f"   Token: {trade.token_id[:16]}... (stored for redemption)")
+        
+        # Sync balance after successful trade
+        self._sync_balance_after_trade()
         
         return True
+    
+    def _sync_balance_after_trade(self):
+        """
+        Sync balance from Polymarket after a live trade.
+        
+        This ensures our internal balance tracking stays accurate
+        with the actual USDC balance on Polymarket.
+        """
+        if config.TEST_MODE:
+            return
+        
+        # Wait a moment for the trade to settle on Polymarket
+        time.sleep(2)
+        
+        # Refresh balance from API
+        success = self.refresh_balance()
+        if success:
+            if config.VERBOSE_LOGGING:
+                print(f"💰 Balance synced: ${self.state.balance:.2f}")
+        else:
+            print("⚠️ Could not sync balance - using internal tracking")
     
     def check_and_resolve_trades(self) -> List[Trade]:
         """
@@ -696,7 +747,7 @@ class ExecutionEngine:
         Resolve a trade and update balance.
         
         In TEST_MODE: Simulates win/loss probabilistically
-        In LIVE mode: Would get actual resolution from Polymarket
+        In LIVE mode: Gets actual resolution from Polymarket and redeems winning shares
         
         Also updates:
         - Daily PnL tracking
@@ -723,6 +774,23 @@ class ExecutionEngine:
             
             trade.payout = payout
             
+            # ════════════════════════════════════════════════════════════════
+            # CRITICAL: Redeem winning shares in LIVE mode
+            # ════════════════════════════════════════════════════════════════
+            if not config.TEST_MODE and trade.token_id:
+                print(f"💰 Redeeming winning shares for trade {trade.trade_id}...")
+                redemption_result = self._redeem_winning_shares(trade)
+                
+                if redemption_result:
+                    trade.redemption_status = "REDEEMED"
+                    trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                    print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                else:
+                    trade.redemption_status = "FAILED"
+                    print(f"⚠️ Redemption may have failed - check Polymarket manually")
+                    print(f"   Token ID: {trade.token_id}")
+                    print(f"   Shares: {trade.filled_shares}")
+            
             # Update actual balance (for bot's internal tracking)
             self.state.balance += payout
             
@@ -746,10 +814,15 @@ class ExecutionEngine:
             
             print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.balance:.2f}")
             
+            # Sync balance from Polymarket after redemption
+            if not config.TEST_MODE:
+                self._sync_balance_after_resolution()
+            
         else:
             trade.outcome = "LOSS"
             trade.status = TradeStatus.RESOLVED_LOSS
             trade.payout = 0.0
+            trade.redemption_status = "N/A"  # No redemption needed for losses
             
             # Update logging_balance: deduct bet (no payout)
             self.state.logging_balance = self.state.logging_balance - trade.bet_size
@@ -893,6 +966,9 @@ class ExecutionEngine:
         Similar to _resolve_trade but uses a provided outcome instead
         of determining it.
         
+        For LIVE mode winning trades, this also triggers redemption
+        of the winning shares to convert them back to USDC.
+        
         Args:
             trade: The trade to resolve
             outcome: "WIN", "LOSS", or "UNKNOWN"
@@ -908,6 +984,23 @@ class ExecutionEngine:
             payout *= (1 - config.ESTIMATED_FEE_PERCENT)
             trade.payout = payout
             
+            # ════════════════════════════════════════════════════════════════
+            # CRITICAL: Redeem winning shares in LIVE mode
+            # ════════════════════════════════════════════════════════════════
+            if not config.TEST_MODE and trade.token_id:
+                print(f"💰 Redeeming winning shares for trade {trade.trade_id}...")
+                redemption_result = self._redeem_winning_shares(trade)
+                
+                if redemption_result:
+                    trade.redemption_status = "REDEEMED"
+                    trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                    print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                else:
+                    trade.redemption_status = "FAILED"
+                    print(f"⚠️ Redemption may have failed - check Polymarket manually")
+                    print(f"   Token ID: {trade.token_id}")
+                    print(f"   Shares: {trade.filled_shares}")
+            
             # Update balances
             self.state.balance += payout
             self.state.logging_balance = self.state.logging_balance - trade.bet_size + payout
@@ -922,10 +1015,15 @@ class ExecutionEngine:
             
             print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.balance:.2f}")
             
+            # Sync balance from Polymarket after redemption
+            if not config.TEST_MODE:
+                self._sync_balance_after_resolution()
+            
         elif outcome == "LOSS":
             trade.outcome = "LOSS"
             trade.status = TradeStatus.RESOLVED_LOSS
             trade.payout = 0.0
+            trade.redemption_status = "N/A"  # No redemption needed for losses
             
             self.state.logging_balance = self.state.logging_balance - trade.bet_size
             trade.balance_after = self.state.logging_balance
@@ -947,6 +1045,7 @@ class ExecutionEngine:
             trade.outcome = "UNKNOWN"
             trade.status = TradeStatus.RESOLVED_LOSS
             trade.payout = 0.0
+            trade.redemption_status = "UNKNOWN"
             
             self.state.logging_balance = self.state.logging_balance - trade.bet_size
             trade.balance_after = self.state.logging_balance
@@ -959,6 +1058,65 @@ class ExecutionEngine:
         
         # Update daily trade counter
         self.state.daily_trades += 1
+    
+    def _redeem_winning_shares(self, trade: Trade) -> Optional[Dict]:
+        """
+        Redeem winning shares for a resolved trade.
+        
+        After a market resolves in our favor, we hold winning shares
+        that need to be converted back to USDC. This method handles
+        that redemption process.
+        
+        Args:
+            trade: The winning trade with token_id and filled_shares
+            
+        Returns:
+            Dict with redemption info if successful, None otherwise
+        """
+        if config.TEST_MODE:
+            return {"success": True, "amount_usdc": trade.payout, "simulated": True}
+        
+        if not trade.token_id:
+            print(f"❌ Cannot redeem: No token ID stored for trade {trade.trade_id}")
+            return None
+        
+        # Use the Polymarket client to redeem shares
+        result = self.polymarket.redeem_winning_shares(
+            token_id=trade.token_id,
+            shares=trade.filled_shares
+        )
+        
+        return result
+    
+    def _sync_balance_after_resolution(self):
+        """
+        Sync balance from Polymarket after trade resolution.
+        
+        This is especially important after winning trades where
+        redemption should have credited USDC to our account.
+        """
+        if config.TEST_MODE:
+            return
+        
+        # Wait for redemption to process
+        time.sleep(3)
+        
+        # Refresh balance from API
+        new_balance = self.polymarket.get_usdc_balance()
+        
+        if new_balance is not None:
+            old_balance = self.state.balance
+            
+            # If API balance is higher than our tracking, use API balance
+            # (This catches any redemption amounts we might have missed)
+            if new_balance > self.state.balance:
+                self.state.balance = new_balance
+                diff = new_balance - old_balance
+                print(f"💰 Balance synced from API: ${old_balance:.2f} → ${new_balance:.2f} (+${diff:.2f})")
+            elif config.VERBOSE_LOGGING:
+                print(f"💰 Balance verified: ${new_balance:.2f}")
+        else:
+            print("⚠️ Could not sync balance from API")
     
     def force_resolve_trade_for_simulation(self, trade: Trade, minutes_passed: float = 15.0):
         """
@@ -999,6 +1157,28 @@ class ExecutionEngine:
             "pnl": self.state.balance - config.INITIAL_VIRTUAL_BALANCE,
             "pnl_percent": ((self.state.balance / config.INITIAL_VIRTUAL_BALANCE) - 1) * 100
         }
+    
+    def check_and_redeem_positions(self) -> Dict:
+        """
+        Check for and redeem any unredeemed winning positions.
+        
+        This is a safety net that runs periodically to ensure
+        no winning positions are left unredeemed.
+        
+        Returns:
+            Dict with redemption summary
+        """
+        if config.TEST_MODE:
+            return {"simulated": True, "total_redeemed": 0}
+        
+        print("\n🔍 Running periodic redemption check...")
+        result = self.polymarket.redeem_all_winning_positions()
+        
+        # If we redeemed anything, sync balance
+        if result.get("total_redeemed", 0) > 0:
+            self.refresh_balance()
+        
+        return result
     
     def print_stats(self):
         """Print current stats to console."""

@@ -11,12 +11,13 @@ A **production-ready** Python trading bot for Polymarket BTC 15-minute Up/Down p
 3. [How the Strategy Works](#-how-the-strategy-works)
 4. [Running Modes Explained](#-running-modes-explained)
 5. [Step-by-Step: Going Live](#-step-by-step-going-live)
-6. [🛡️ Safe Live Trading Tutorial](#️-safe-live-trading-tutorial) ⭐ **NEW**
+6. [🛡️ Safe Live Trading Tutorial](#️-safe-live-trading-tutorial)
 7. [Configuration Reference](#-configuration-reference)
 8. [Understanding the Code](#-understanding-the-code)
 9. [Safety Features](#-safety-features)
-10. [Troubleshooting](#-troubleshooting)
-11. [FAQ](#-faq)
+10. [💰 Live Deployment: Automatic Redemption System](#-live-deployment-automatic-redemption-system) ⭐ **NEW**
+11. [Troubleshooting](#-troubleshooting)
+12. [FAQ](#-faq)
 
 ---
 
@@ -700,6 +701,7 @@ All settings are in your `.env` file.
 | `TRADE_COOLDOWN_SECONDS` | `60` | Wait between trades |
 | `MAX_MARKET_AGE_SECONDS` | `180` | Only trade markets < 3 min old |
 | `ORDER_FILL_TIMEOUT` | `60` | Max seconds to wait for order fill |
+| `REDEMPTION_CHECK_INTERVAL` | `300` | Seconds between redemption safety checks |
 
 ### API Credentials (LIVE mode only)
 
@@ -722,19 +724,20 @@ polymarket-bot/
 │
 ├── main.py           # 🚀 Entry point - run this to start the bot
 ├── config.py         # ⚙️ Configuration loading from .env
-├── auth.py           # 🔐 Polymarket API authentication
-├── market.py         # 🏪 Polymarket market interactions
+├── auth.py           # 🔐 Polymarket API authentication (L1 & L2)
+├── market.py         # 🏪 Polymarket interactions, orders, redemption
 ├── price_feed.py     # 📊 BTC price data from Binance
 ├── strategy.py       # 🧠 Trading strategy logic
-├── execution.py      # 💱 Trade execution engine
+├── execution.py      # 💱 Trade execution, resolution, redemption
 ├── logger.py         # 📝 Trade logging to CSV
 │
 ├── .env              # 🔒 Your secret configuration (don't commit!)
 ├── .env.example      # 📋 Template for .env file
 ├── requirements.txt  # 📦 Python dependencies
-├── trades.csv        # 📈 Trade history log
+├── trades.csv        # 📈 Trade history log (with redemption data)
 │
-└── test_auth.py      # 🧪 Authentication tests
+├── test_auth.py      # 🧪 Authentication tests
+└── test_live_features.py  # 🧪 Live deployment feature tests
 ```
 
 ### How Data Flows
@@ -745,12 +748,17 @@ polymarket-bot/
 │  (BTC price) │     │ (decisions)  │     │   (trades)   │
 └──────────────┘     └──────────────┘     └──────────────┘
        │                    │                    │
-       │                    │                    │
-       ▼                    ▼                    ▼
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Binance    │     │    market    │     │    logger    │
-│     API      │     │ (Polymarket) │     │  (CSV file)  │
-└──────────────┘     └──────────────┘     └──────────────┘
+       │                    │                    ▼
+       ▼                    ▼              ┌──────────────┐
+┌──────────────┐     ┌──────────────┐     │  redemption  │
+│   Binance    │     │    market    │◀────│   (USDC)     │
+│     API      │     │ (Polymarket) │     └──────────────┘
+└──────────────┘     └──────────────┘           │
+                            │                   ▼
+                            │            ┌──────────────┐
+                            └───────────▶│    logger    │
+                                         │  (CSV file)  │
+                                         └──────────────┘
 ```
 
 ### Key Classes and Functions
@@ -760,7 +768,9 @@ polymarket-bot/
 from auth import get_auth, AuthLevel
 
 auth = get_auth()
-auth.is_ready(AuthLevel.L2)  # Check if can place orders
+auth.is_ready(AuthLevel.L1)  # API key auth (read)
+auth.is_ready(AuthLevel.L2)  # Wallet auth (write/trade)
+auth.sign_order(order_data)  # Sign orders for CLOB
 ```
 
 **`market.py`** - Market Operations
@@ -768,10 +778,22 @@ auth.is_ready(AuthLevel.L2)  # Check if can place orders
 from market import get_client
 
 client = get_client()
-client.get_usdc_balance()        # Get wallet balance
-client.place_order(...)          # Place a trade
-client.wait_for_order_fill(...)  # Wait for execution
-client.get_market_resolution(...) # Check if we won/lost
+
+# Balance & Positions
+client.get_usdc_balance()          # Get wallet USDC balance
+client.get_open_positions()        # Get all open positions
+client.get_position_for_token(id)  # Get specific position
+
+# Trading
+client.place_order(...)            # Place a trade
+client.wait_for_order_fill(...)    # Wait for execution
+client.cancel_order(order_id)      # Cancel unfilled order
+
+# Resolution & Redemption
+client.get_market_resolution(...)  # Check if market resolved
+client.check_trade_resolution(...) # Check WIN/LOSS
+client.redeem_winning_shares(...)  # Convert shares to USDC ⭐
+client.redeem_all_winning_positions()  # Batch redemption ⭐
 ```
 
 **`execution.py`** - Trade Engine
@@ -779,16 +801,30 @@ client.get_market_resolution(...) # Check if we won/lost
 from execution import ExecutionEngine
 
 engine = ExecutionEngine(client)
-engine.can_trade(5.0)          # Check if trading allowed
-engine.execute_trade(...)      # Execute a trade
-engine.get_daily_stats()       # Get daily statistics
+
+# Trading
+engine.can_trade(5.0)           # Check if trading allowed
+engine.execute_trade(...)       # Execute a trade
+engine.is_in_cooldown()         # Check cooldown status
+
+# Resolution & Redemption
+engine.check_and_resolve_trades()    # Resolve completed trades
+engine.check_and_redeem_positions()  # Safety redemption check ⭐
+engine.refresh_balance()             # Sync balance from API
+
+# Statistics
+engine.get_daily_stats()        # Get daily statistics
+engine.get_stats()              # Get overall statistics
+engine.print_stats()            # Print to console
 ```
 
 **`strategy.py`** - Strategy Logic
 ```python
-from strategy import calculate_bet_size
+from strategy import analyze_trade_opportunity, should_trade, calculate_bet_size
 
-bet_size = calculate_bet_size(balance)
+signal = analyze_trade_opportunity(market, polymarket, binance)
+if should_trade(signal):
+    bet_size = calculate_bet_size(balance)
 ```
 
 ---
@@ -849,6 +885,210 @@ print(f"Daily PnL: ${stats['daily_pnl']:+.2f}")
 print(f"Trades today: {stats['trades']}")
 print(f"Consecutive losses: {stats['consecutive_losses']}")
 print(f"Trading paused: {stats['trading_paused']}")
+```
+
+---
+
+## 💰 Live Deployment: Automatic Redemption System
+
+> **CRITICAL**: This section explains how the bot handles winning share redemption - a feature that is **essential** for live trading with real money.
+
+### Understanding Polymarket's Payout System
+
+When you win a trade on Polymarket, your winnings are **NOT automatically credited** to your USDC balance. Instead:
+
+1. You receive **winning shares** (tokens)
+2. These shares must be **redeemed** to convert back to USDC
+3. Without redemption, your winnings stay locked as tokens!
+
+**This bot handles redemption automatically.** Here's how:
+
+### How Automatic Redemption Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TRADE LIFECYCLE (LIVE MODE)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. TRADE EXECUTION                                              │
+│     ├─> Place order on Polymarket                                │
+│     ├─> Store token_id (CRITICAL for redemption)                 │
+│     ├─> Store condition_id (for resolution tracking)             │
+│     └─> Sync balance from API                                    │
+│                                                                  │
+│  2. WAIT FOR MARKET RESOLUTION (15 minutes)                      │
+│     └─> Bot continues running, checking other opportunities      │
+│                                                                  │
+│  3. RESOLUTION CHECK                                             │
+│     ├─> Query Polymarket API for market outcome                  │
+│     └─> Determine if our position WON or LOST                    │
+│                                                                  │
+│  4. IF WIN: AUTOMATIC REDEMPTION                                 │
+│     ├─> Call redeem_winning_shares(token_id)                     │
+│     ├─> Convert winning shares → USDC                            │
+│     ├─> Update redemption_status = "REDEEMED"                    │
+│     ├─> Record redemption_amount in trade log                    │
+│     └─> Sync balance from API to confirm credit                  │
+│                                                                  │
+│  5. IF LOSS: No redemption needed                                │
+│     └─> Mark redemption_status = "N/A"                           │
+│                                                                  │
+│  6. PERIODIC SAFETY CHECK (every 5 minutes)                      │
+│     ├─> Scan for any unredeemed winning positions                │
+│     └─> Attempt redemption of any missed shares                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Features of the Redemption System
+
+#### 1. Token ID Tracking
+
+Every trade stores the `token_id` of the purchased position:
+
+```python
+# When executing a live trade:
+trade.token_id = market.tokens.get("up")  # or "down"
+trade.condition_id = market.condition_id
+```
+
+This is **essential** because without the token ID, we cannot redeem!
+
+#### 2. Automatic Redemption on WIN
+
+When a trade resolves as WIN, the bot automatically:
+
+```python
+# Inside _resolve_trade_with_outcome():
+if outcome == "WIN" and not config.TEST_MODE:
+    redemption_result = self._redeem_winning_shares(trade)
+    trade.redemption_status = "REDEEMED"
+    trade.redemption_amount = redemption_result["amount_usdc"]
+```
+
+#### 3. Balance Synchronization
+
+After redemption, the bot syncs with Polymarket:
+
+```python
+# Ensures internal balance matches actual USDC:
+self._sync_balance_after_resolution()
+```
+
+#### 4. Periodic Redemption Safety Net
+
+Every 5 minutes (configurable), the bot checks for missed redemptions:
+
+```python
+# In main trading loop:
+if time_since_last_check >= REDEMPTION_CHECK_INTERVAL:
+    engine.check_and_redeem_positions()
+```
+
+### Trade CSV Logging (New Fields)
+
+All trades now log additional fields for live deployment:
+
+| Column | Description | Example |
+|--------|-------------|---------|
+| `token_id` | Token purchased | `21742633...` |
+| `condition_id` | Market condition | `0x8f3e...` |
+| `redemption_status` | Redemption state | `REDEEMED`, `PENDING`, `N/A`, `FAILED` |
+| `redemption_amount` | USDC redeemed | `12.50` |
+| `order_id` | Polymarket order ID | `abc123...` |
+| `filled_price` | Actual fill price | `0.4825` |
+| `filled_shares` | Shares purchased | `20.7254` |
+
+### Configuration Options
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `REDEMPTION_CHECK_INTERVAL` | `300` | Seconds between redemption safety checks |
+| `ORDER_FILL_TIMEOUT` | `60` | Max seconds to wait for order fill |
+
+### Manual Redemption Commands
+
+If needed, you can manually trigger redemption:
+
+```python
+from market import get_client
+
+client = get_client()
+
+# Redeem a specific token
+result = client.redeem_winning_shares(
+    token_id="21742633...",
+    shares=10.5
+)
+print(f"Redeemed: ${result['amount_usdc']:.2f}")
+
+# Redeem ALL unredeemed positions
+summary = client.redeem_all_winning_positions()
+print(f"Total redeemed: ${summary['total_redeemed']:.2f}")
+```
+
+### Verifying Redemption Worked
+
+After a winning trade, verify in your logs:
+
+```bash
+# Check recent trades
+tail -5 trades.csv | cut -d',' -f1,13,20,21,22
+
+# Expected output for a WIN:
+# timestamp,outcome,token_id,redemption_status,redemption_amount
+# 2026-02-05T12:00:00,WIN,21742...,REDEEMED,12.50
+```
+
+Also verify on Polymarket:
+1. Log into [polymarket.com](https://polymarket.com)
+2. Check your USDC balance
+3. Confirm it increased after the winning trade
+
+### Troubleshooting Redemption Issues
+
+#### "Redemption failed" in logs
+
+**Cause:** API error or network issue
+
+**Solution:**
+1. Check if you still hold the winning shares on Polymarket
+2. Run manual redemption: `client.redeem_all_winning_positions()`
+3. If still failing, redeem manually on the Polymarket website
+
+#### "No token_id stored" error
+
+**Cause:** Trade was executed before the token tracking update
+
+**Solution:**
+1. Old trades cannot be auto-redeemed
+2. Check Polymarket website for unredeemed positions
+3. Redeem manually on the website
+
+#### Balance not updating after WIN
+
+**Cause:** Redemption might have failed silently
+
+**Solution:**
+1. Check `trades.csv` for `redemption_status`
+2. If `FAILED` or `PENDING`, run manual redemption
+3. Verify on Polymarket website
+
+### Position Tracking API
+
+View your current open positions:
+
+```python
+from market import get_client
+
+client = get_client()
+positions = client.get_open_positions()
+
+for pos in positions:
+    print(f"Token: {pos['token_id'][:16]}...")
+    print(f"Shares: {pos['size']:.4f}")
+    print(f"Avg Price: ${pos['avg_price']:.4f}")
+    print("---")
 ```
 
 ---
@@ -954,11 +1194,14 @@ Your private key is stored in `.env` locally. Never commit this file to git. The
 
 All trades are logged to `trades.csv` with:
 
+### Core Trade Fields
+
 | Column | Description |
 |--------|-------------|
-| `timestamp` | When the trade was placed |
+| `timestamp` | When the trade was placed (ISO format) |
 | `trade_id` | Unique trade identifier |
 | `market_id` | Polymarket market ID |
+| `market_question` | Market question text |
 | `side` | UP or DOWN |
 | `entry_odds` | Price paid (e.g., 0.48 = 48%) |
 | `fair_probability` | Our estimated fair probability |
@@ -967,9 +1210,29 @@ All trades are logged to `trades.csv` with:
 | `bet_size` | Amount bet in USD |
 | `balance_before` | Balance before trade |
 | `balance_after` | Balance after resolution |
-| `outcome` | WIN or LOSS |
+| `outcome` | WIN, LOSS, or PENDING |
 | `payout` | Amount received if won |
+| `profit_loss` | Net profit or loss |
 | `mode` | TEST or LIVE |
+
+### Live Trading Fields (New)
+
+| Column | Description |
+|--------|-------------|
+| `order_id` | Polymarket CLOB order ID |
+| `filled_price` | Actual fill price received |
+| `filled_shares` | Number of shares purchased |
+| `token_id` | Token ID (needed for redemption) |
+| `condition_id` | Market condition ID |
+| `redemption_status` | REDEEMED, PENDING, FAILED, or N/A |
+| `redemption_amount` | USDC amount redeemed |
+
+### Example CSV Row
+
+```csv
+timestamp,trade_id,market_id,side,entry_odds,outcome,payout,token_id,redemption_status,redemption_amount
+2026-02-05T14:30:00,T1234567,btc-updown-15m-123,UP,0.4800,WIN,12.50,217426...,REDEEMED,12.50
+```
 
 ---
 

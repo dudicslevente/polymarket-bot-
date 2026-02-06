@@ -105,7 +105,7 @@ class PolymarketClient:
             url: Full URL to request
             params: Query parameters for GET requests
             data: JSON body for POST requests
-            authenticated: Whether to use L1 auth headers
+            authenticated: Whether to use L2 auth headers
             retries: Number of retry attempts
         
         Returns None on error (never crashes).
@@ -119,14 +119,14 @@ class PolymarketClient:
             if authenticated and not config.TEST_MODE:
                 try:
                     # Extract path from URL for auth signature
+                    # IMPORTANT: Sign only the base path, NOT including query parameters
                     from urllib.parse import urlparse
                     parsed = urlparse(url)
-                    path = parsed.path
-                    if parsed.query:
-                        path += "?" + parsed.query
+                    path = parsed.path  # Don't include query params in signature
                     
                     body_str = json.dumps(data) if data else ""
-                    headers = self._auth.get_l1_headers(method, path, body_str)
+                    # Use L2 headers for authenticated requests (HMAC-based)
+                    headers = self._auth.get_l2_headers(method, path, body_str)
                 except AuthError as e:
                     print(f"❌ Authentication error: {e}")
                     return None
@@ -1413,14 +1413,16 @@ class PolymarketClient:
                 print("ℹ️ get_usdc_balance called in TEST_MODE - returning None")
             return None
         
-        # Check if auth is ready
-        if not self._auth.is_ready(AuthLevel.L1):
-            print("❌ Cannot fetch balance: Authentication not configured")
+        # Check if auth is ready - need L2 for balance-allowance endpoint
+        if not self._auth.is_ready(AuthLevel.L2):
+            print("❌ Cannot fetch balance: Authentication not configured (L2 required)")
             return None
         
         try:
-            # Polymarket CLOB API endpoint for balance
-            url = f"{self.clob_url}/balance"
+            # Polymarket CLOB API endpoint for balance-allowance
+            # This is the correct endpoint as per py-clob-client
+            # Parameters: asset_type=COLLATERAL for USDC balance
+            url = f"{self.clob_url}/balance-allowance?asset_type=COLLATERAL&signature_type=0"
             
             result = self._make_request("GET", url, authenticated=True)
             
@@ -1510,12 +1512,13 @@ class PolymarketClient:
         if config.TEST_MODE:
             return None
         
-        if not self._auth.is_ready(AuthLevel.L1):
-            print("❌ Cannot fetch balances: Authentication not configured")
+        if not self._auth.is_ready(AuthLevel.L2):
+            print("❌ Cannot fetch balances: Authentication not configured (L2 required)")
             return None
         
         try:
-            url = f"{self.clob_url}/balances"
+            # Use balance-allowance endpoint for COLLATERAL (USDC)
+            url = f"{self.clob_url}/balance-allowance?asset_type=COLLATERAL&signature_type=0"
             result = self._make_request("GET", url, authenticated=True)
             
             if result is None:
@@ -1524,7 +1527,10 @@ class PolymarketClient:
             # Parse into a simple dict
             balances = {}
             
+            # The response should contain balance field
             if isinstance(result, dict):
+                if "balance" in result:
+                    balances["USDC"] = float(result["balance"])
                 for key, value in result.items():
                     try:
                         balances[key] = float(value)

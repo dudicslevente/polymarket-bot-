@@ -50,10 +50,11 @@ def test_live_mode_no_credentials():
     print("TEST 2: Auth in LIVE mode (no credentials)")
     print("="*60)
     
-    # Clear any existing credentials
+    # Set credentials to empty strings (not remove them) to prevent load_dotenv from 
+    # re-reading from .env file. load_dotenv by default doesn't override existing vars.
     for key in ['POLYMARKET_API_KEY', 'POLYMARKET_API_SECRET', 'POLYMARKET_PASSPHRASE', 
                 'WALLET_ADDRESS', 'WALLET_PRIVATE_KEY']:
-        os.environ.pop(key, None)
+        os.environ[key] = ''
     
     os.environ['TEST_MODE'] = 'false'
     

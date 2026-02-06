@@ -81,6 +81,7 @@ class ExecutionState:
     """
     balance: float = config.INITIAL_VIRTUAL_BALANCE
     logging_balance: float = config.INITIAL_VIRTUAL_BALANCE  # For CSV consistency
+    session_starting_balance: float = config.INITIAL_VIRTUAL_BALANCE  # Balance when bot started
     trades: List[Trade] = field(default_factory=list)
     active_trades: Dict[str, Trade] = field(default_factory=dict)
     last_trade_time: Optional[datetime] = None
@@ -126,6 +127,7 @@ class ExecutionEngine:
         if config.TEST_MODE:
             self.state.balance = config.INITIAL_VIRTUAL_BALANCE
             self.state.logging_balance = config.INITIAL_VIRTUAL_BALANCE
+            self.state.session_starting_balance = config.INITIAL_VIRTUAL_BALANCE
             self.state.daily_starting_balance = config.INITIAL_VIRTUAL_BALANCE
             print(f"💰 Starting virtual balance: ${self.state.balance:.2f}")
         else:
@@ -162,6 +164,7 @@ class ExecutionEngine:
         
         self.state.balance = real_balance
         self.state.logging_balance = real_balance
+        self.state.session_starting_balance = real_balance
         self.state.daily_starting_balance = real_balance
         
         print(f"✅ Live wallet balance: ${real_balance:.2f}")
@@ -1146,16 +1149,19 @@ class ExecutionEngine:
         if self.state.total_trades > 0:
             win_rate = (self.state.wins / self.state.total_trades) * 100
         
+        starting = self.state.session_starting_balance
+        pnl_percent = ((self.state.balance / starting) - 1) * 100 if starting > 0 else 0
+        
         return {
             "balance": self.state.balance,
-            "starting_balance": config.INITIAL_VIRTUAL_BALANCE,
+            "starting_balance": starting,
             "total_trades": self.state.total_trades,
             "wins": self.state.wins,
             "losses": self.state.losses,
             "win_rate": win_rate,
             "active_trades": len(self.state.active_trades),
-            "pnl": self.state.balance - config.INITIAL_VIRTUAL_BALANCE,
-            "pnl_percent": ((self.state.balance / config.INITIAL_VIRTUAL_BALANCE) - 1) * 100
+            "pnl": self.state.balance - starting,
+            "pnl_percent": pnl_percent
         }
     
     def check_and_redeem_positions(self) -> Dict:

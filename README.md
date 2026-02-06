@@ -11,11 +11,12 @@ A **production-ready** Python trading bot for Polymarket BTC 15-minute Up/Down p
 3. [How the Strategy Works](#-how-the-strategy-works)
 4. [Running Modes Explained](#-running-modes-explained)
 5. [Step-by-Step: Going Live](#-step-by-step-going-live)
+   - [CLOB Setup & Wallet Funding](#step-5-fund-your-wallet--set-up-clob-trading)
 6. [🛡️ Safe Live Trading Tutorial](#️-safe-live-trading-tutorial)
 7. [Configuration Reference](#-configuration-reference)
 8. [Understanding the Code](#-understanding-the-code)
 9. [Safety Features](#-safety-features)
-10. [💰 Live Deployment: Automatic Redemption System](#-live-deployment-automatic-redemption-system) ⭐ **NEW**
+10. [💰 Live Deployment: Automatic Redemption System](#-live-deployment-automatic-redemption-system)
 11. [Troubleshooting](#-troubleshooting)
 12. [FAQ](#-faq)
 
@@ -309,13 +310,81 @@ Expected output:
 🎉 ALL TESTS PASSED!
 ```
 
-### Step 5: Fund Your Wallet
+### Step 5: Fund Your Wallet & Set Up CLOB Trading
 
-Ensure your wallet has:
-- **USDC on Polygon**: At least $20-50 to start
-- **MATIC on Polygon**: ~0.1 MATIC for gas fees
+> ⚠️ **IMPORTANT**: The Polymarket CLOB API trades directly from your wallet, NOT from your Polymarket website balance. These are separate systems!
 
-You can bridge assets to Polygon using the [Polygon Bridge](https://wallet.polygon.technology/).
+#### Understanding Polymarket's Two Systems
+
+| System | Description | Used By |
+|--------|-------------|---------|
+| **Website (Proxy Wallet)** | Polymarket holds funds for you | Website trading |
+| **CLOB API (Your Wallet)** | Funds stay in YOUR wallet | This bot |
+
+#### What You Need in Your Wallet
+
+| Token | Amount | Purpose |
+|-------|--------|---------|
+| **USDC.e** | $20-50+ | Trading capital |
+| **POL** | 0.5+ POL | Gas fees (~$0.01-0.05 per trade) |
+
+> **⚠️ CRITICAL**: You must have **USDC.e** (contract: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`), NOT regular USDC! Polymarket only accepts USDC.e.
+
+#### How to Get USDC.e
+
+**Option 1: Withdraw from Polymarket Website (Easiest)**
+1. Go to https://polymarket.com
+2. Click **Portfolio** → **Wallet** → **Withdraw**
+3. Withdraw to your wallet address
+4. This automatically gives you USDC.e
+
+**Option 2: Swap on DEX**
+- If you have regular USDC on Polygon, swap it to USDC.e on [Uniswap](https://app.uniswap.org) or [QuickSwap](https://quickswap.exchange)
+
+**Option 3: Bridge from Ethereum**
+- Use the [Polygon Bridge](https://wallet.polygon.technology/) to bridge USDC from Ethereum (becomes USDC.e)
+
+#### Set Up CLOB Trading Allowances
+
+Before the bot can trade, you must approve Polymarket's contracts to access your USDC.e:
+
+```bash
+# Check your current status
+python setup_clob_trading.py status
+
+# Set up allowances (one-time setup, requires POL for gas)
+python setup_clob_trading.py approve
+```
+
+Expected output after successful setup:
+```
+============================================================
+CLOB STATUS CHECK
+============================================================
+
+Wallet: 0xYourWalletAddress
+
+CLOB Balance: $XX.XX USDC
+
+Allowances:
+  CTF Exchange: ✅ Approved
+  Neg Risk CTF Exchange: ✅ Approved
+  Neg Risk Adapter: ✅ Approved
+
+✅ Ready to trade!
+```
+
+#### Gas Fees (POL)
+
+Every trade requires a small amount of POL for gas:
+
+| Action | Approx Cost |
+|--------|-------------|
+| Place order | $0.01-0.05 |
+| Cancel order | $0.005-0.02 |
+| Claim winnings | $0.01-0.05 |
+
+With **0.5 POL**, you can make **hundreds of trades**. Polygon gas is very cheap!
 
 ### Step 6: Start Live Trading
 
@@ -1121,6 +1190,70 @@ for pos in positions:
 2. Ensure wallet address and private key match
 3. Run `python test_auth.py` to diagnose
 
+#### "eth-account package not installed" (Live Trading)
+
+**Cause:** The `eth-account` package is required for wallet verification in LIVE trading mode but is not installed.
+
+**Solution:**
+```bash
+# Install the missing package
+pip install eth-account
+
+# Or reinstall all requirements (recommended)
+pip install -r requirements.txt
+```
+
+> **Note:** This package is only required when `TEST_MODE=false`. Test mode (paper trading) does not require wallet verification.
+
+#### "CLOB Balance shows $0" (But I Have Money on Polymarket!)
+
+**Cause:** Your funds are in Polymarket's **website proxy wallet**, not in your **direct wallet** where the CLOB API trades from.
+
+**Explanation:**
+- **Polymarket Website** = Funds held by Polymarket (proxy wallet)
+- **CLOB API** = Trades from YOUR wallet directly
+
+**Solution:**
+1. Withdraw funds from Polymarket website to your wallet:
+   - Go to https://polymarket.com → Portfolio → Wallet → Withdraw
+   - Send to your wallet address
+2. Run `python setup_clob_trading.py status` to verify
+
+#### "not enough balance / allowance"
+
+**Cause:** Either you don't have USDC.e, or you haven't approved the CLOB contracts.
+
+**Solution:**
+```bash
+# Check your status
+python setup_clob_trading.py status
+
+# If allowances show ❌, run:
+python setup_clob_trading.py approve
+```
+
+#### "Wrong USDC Type" / Balance Not Detected
+
+**Cause:** You have regular **USDC** instead of **USDC.e**.
+
+**Explanation:**
+- USDC.e: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` ✅ (Polymarket uses this)
+- USDC: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359` ❌ (NOT used by Polymarket)
+
+**Solution:**
+1. Swap USDC → USDC.e on [Uniswap](https://app.uniswap.org) or [QuickSwap](https://quickswap.exchange)
+2. Or withdraw from Polymarket website (gives you USDC.e automatically)
+
+#### "Rate limit exhausted" During Setup
+
+**Cause:** The Polygon RPC is rate-limiting your requests.
+
+**Solution:**
+```bash
+# Wait 30 seconds, then try again
+sleep 30 && python setup_clob_trading.py approve
+```
+
 #### "Order fill timeout"
 
 **Cause:** Market moved or low liquidity.
@@ -1188,6 +1321,37 @@ Yes! The strategy is in `strategy.py`. Test any changes thoroughly in simulation
 
 Your private key is stored in `.env` locally. Never commit this file to git. The key is used only for signing orders and is never sent to any server.
 
+### Why can't the bot use my Polymarket website balance?
+
+The CLOB API trades directly from your wallet, not from Polymarket's proxy wallet. This is actually more secure because:
+- **You keep control** of your funds at all times
+- **Non-custodial** - Polymarket never holds your money
+- Funds stay in YOUR wallet until a trade executes
+
+To use your website balance, withdraw it to your wallet first.
+
+### What's the difference between USDC and USDC.e?
+
+| Token | Contract | Used By |
+|-------|----------|---------|
+| **USDC.e** | `0x2791Bca1...` | ✅ Polymarket |
+| **USDC** | `0x3c499c54...` | ❌ Not Polymarket |
+
+USDC.e is "bridged USDC" from Ethereum. Polymarket only accepts USDC.e.
+
+### How do I get USDC.e?
+
+1. **Withdraw from Polymarket website** (automatically gives USDC.e)
+2. **Swap on DEX** (Uniswap/QuickSwap: USDC → USDC.e)
+3. **Bridge from Ethereum** (Polygon Bridge converts to USDC.e)
+
+### Does every trade cost gas (POL)?
+
+Yes, but it's very cheap on Polygon:
+- ~$0.01-0.05 per trade
+- 0.5 POL = hundreds of trades
+- You'll rarely need to top up
+
 ---
 
 ## 📊 Trade Logging
@@ -1215,7 +1379,7 @@ All trades are logged to `trades.csv` with:
 | `profit_loss` | Net profit or loss |
 | `mode` | TEST or LIVE |
 
-### Live Trading Fields (New)
+### Live Trading Fields
 
 | Column | Description |
 |--------|-------------|

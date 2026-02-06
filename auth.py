@@ -184,13 +184,14 @@ class PolymarketAuth:
         Generate L1 authenticated headers for API requests.
         
         L1 authentication is used for:
-        - Reading account balances
-        - Checking positions
-        - Getting order history
+        - Creating/deriving API keys
+        - Initial wallet authentication
+        
+        Uses EIP-712 signing for authentication.
         
         Args:
             method: HTTP method (GET, POST, DELETE)
-            path: API path (e.g., "/balance")
+            path: API path (e.g., "/auth/api-key")
             body: Request body as string (for POST requests)
             
         Returns:
@@ -202,37 +203,20 @@ class PolymarketAuth:
         if not self.is_ready(AuthLevel.L1):
             raise AuthError("L1 authentication credentials not configured")
         
-        timestamp = str(int(time.time() * 1000))
+        # L1 headers use EIP-712 signature
+        # This is used for initial API key creation/derivation
+        timestamp = int(time.time())
+        nonce = 0
         
-        # Create the signature message
-        # Format: timestamp + method + path + body
-        message = timestamp + method.upper() + path + body
-        
-        # HMAC-SHA256 signature
-        # Note: Polymarket expects the secret to be base64 decoded before signing
-        try:
-            # Try base64 decoding the secret (Polymarket's format)
-            decoded_secret = base64.b64decode(self.credentials.api_secret)
-            signature = hmac.new(
-                decoded_secret,
-                message.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-        except Exception:
-            # Fallback: use secret directly if not base64 encoded
-            signature = hmac.new(
-                self.credentials.api_secret.encode('utf-8'),
-                message.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
+        # Sign using EIP-712 format
+        signature = self._sign_clob_auth_message(timestamp, nonce)
         
         return {
             "Content-Type": "application/json",
-            "POLY-ADDRESS": self.credentials.wallet_address or "",
-            "POLY-API-KEY": self.credentials.api_key,
-            "POLY-PASSPHRASE": self.credentials.passphrase,
-            "POLY-TIMESTAMP": timestamp,
-            "POLY-SIGNATURE": signature,
+            "POLY_ADDRESS": self.credentials.wallet_address or "",
+            "POLY_SIGNATURE": signature,
+            "POLY_TIMESTAMP": str(timestamp),
+            "POLY_NONCE": str(nonce),
         }
     
     def get_l2_headers(
@@ -242,15 +226,20 @@ class PolymarketAuth:
         body: str = ""
     ) -> Dict[str, str]:
         """
-        Generate L2 authenticated headers for order operations.
+        Generate L2 authenticated headers for CLOB API requests.
         
-        L2 authentication includes L1 headers plus wallet-based signing.
-        Used for placing, cancelling, and modifying orders.
+        L2 authentication is used for:
+        - Reading account balances
+        - Checking positions
+        - Getting order history
+        - Placing orders
+        
+        Uses HMAC-SHA256 signature with API credentials.
         
         Args:
             method: HTTP method (GET, POST, DELETE)
-            path: API path (e.g., "/order")
-            body: Request body as string
+            path: API path (e.g., "/balance-allowance") - should NOT include query params
+            body: Request body as string (for POST requests)
             
         Returns:
             Dictionary of headers to include in the request
@@ -261,12 +250,108 @@ class PolymarketAuth:
         if not self.is_ready(AuthLevel.L2):
             raise AuthError("L2 authentication credentials not configured")
         
-        # L2 includes all L1 headers
-        headers = self.get_l1_headers(method, path, body)
+        # Timestamp in seconds (not milliseconds)
+        timestamp = int(time.time())
         
-        # Additional L2 verification is handled at the order signing level
-        # The order itself contains the wallet signature
-        return headers
+        # Build HMAC signature following py-clob-client format
+        # Format: timestamp + method + path + body
+        # Note: path should NOT include query parameters
+        message = str(timestamp) + str(method) + str(path)
+        if body:
+            # Replace single quotes with double quotes for consistency with Go/TypeScript
+            message += str(body).replace("'", '"')
+        
+        # HMAC-SHA256 signature with base64-encoded result
+        try:
+            # Decode the base64 secret (urlsafe_b64decode handles both standard and URL-safe base64)
+            decoded_secret = base64.urlsafe_b64decode(self.credentials.api_secret)
+            signature = hmac.new(
+                decoded_secret,
+                message.encode('utf-8'),
+                hashlib.sha256
+            ).digest()
+            # Base64 encode the signature (urlsafe)
+            signature_b64 = base64.urlsafe_b64encode(signature).decode('utf-8')
+        except Exception as e:
+            raise AuthError(f"Failed to create HMAC signature: {e}")
+        
+        return {
+            "Content-Type": "application/json",
+            "POLY_ADDRESS": self.credentials.wallet_address or "",
+            "POLY_SIGNATURE": signature_b64,
+            "POLY_TIMESTAMP": str(timestamp),
+            "POLY_API_KEY": self.credentials.api_key,
+            "POLY_PASSPHRASE": self.credentials.passphrase,
+        }
+    
+    def _sign_clob_auth_message(self, timestamp: int, nonce: int) -> str:
+        """
+        Sign a CLOB authentication message using EIP-712.
+        
+        This is used for L1 authentication (API key creation/derivation).
+        
+        Args:
+            timestamp: Unix timestamp
+            nonce: Nonce value
+            
+        Returns:
+            Hex-encoded signature
+        """
+        try:
+            from eth_account import Account
+            from eth_account.messages import encode_structured_data
+            
+            # EIP-712 domain for CLOB authentication
+            domain = {
+                "name": "ClobAuthDomain",
+                "version": "1",
+                "chainId": 137,  # Polygon mainnet
+            }
+            
+            # Message to sign
+            message = {
+                "address": self.credentials.wallet_address,
+                "timestamp": str(timestamp),
+                "nonce": nonce,
+                "message": "This message attests that I control the given wallet",
+            }
+            
+            # Full EIP-712 typed data
+            typed_data = {
+                "types": {
+                    "EIP712Domain": [
+                        {"name": "name", "type": "string"},
+                        {"name": "version", "type": "string"},
+                        {"name": "chainId", "type": "uint256"},
+                    ],
+                    "ClobAuth": [
+                        {"name": "address", "type": "address"},
+                        {"name": "timestamp", "type": "string"},
+                        {"name": "nonce", "type": "uint256"},
+                        {"name": "message", "type": "string"},
+                    ],
+                },
+                "primaryType": "ClobAuth",
+                "domain": domain,
+                "message": message,
+            }
+            
+            # Sign the typed data
+            account = Account.from_key(self.credentials.private_key)
+            signed = account.sign_message(encode_structured_data(typed_data))
+            
+            sig_hex = signed.signature.hex()
+            if not sig_hex.startswith("0x"):
+                sig_hex = "0x" + sig_hex
+            return sig_hex
+            
+        except ImportError:
+            raise AuthError(
+                "eth-account package not installed. "
+                "Install with: pip install eth-account"
+            )
+        except Exception as e:
+            raise AuthError(f"Failed to sign auth message: {e}")
     
     def _get_eth_account(self):
         """

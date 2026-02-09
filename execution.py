@@ -506,7 +506,13 @@ class ExecutionEngine:
             # Mark market as traded
             self.polymarket.mark_as_traded(signal.market)
             
-            print(f"✅ Trade executed: {trade.side} ${bet_size:.2f} @ {trade.entry_odds:.3f}")
+            # If bet_size was adjusted (e.g., to meet minimum share requirements),
+            # update the balance to reflect the actual amount spent
+            if trade.bet_size != bet_size:
+                # Restore the original deduction and apply the correct one
+                self.state.balance = actual_balance_before - trade.bet_size
+            
+            print(f"✅ Trade executed: {trade.side} ${trade.bet_size:.2f} @ {trade.entry_odds:.3f}")
             print(f"   Balance: ${balance_before_logging:.2f} → ${self.state.balance:.2f}")
             
             return trade
@@ -574,6 +580,32 @@ class ExecutionEngine:
         if config.VERBOSE_LOGGING:
             print(f"📋 Token ID stored for redemption: {trade.token_id[:16]}...")
         
+        # ─────────────────────────────────────────────────────────────────────
+        # PRE-EXECUTION PRICE DRIFT CHECK
+        # ─────────────────────────────────────────────────────────────────────
+        # Re-fetch current prices just before order placement to catch any
+        # significant market movement since the signal was detected.
+        # This prevents buying at much higher prices than the signal indicated.
+        current_prices = self.polymarket.get_best_prices(signal.market, polymarket_side)
+        if current_prices and not current_prices.get("is_fallback", True):
+            current_ask = current_prices.get("ask", 0)
+            signal_price = signal.market_odds
+            
+            # Check if price has drifted up significantly
+            price_drift = current_ask - signal_price
+            max_drift = getattr(config, 'MAX_PRICE_DRIFT', 0.03)  # Default 3 cents
+            
+            if price_drift > max_drift:
+                print(f"⚠️ PRICE DRIFT TOO HIGH - Order rejected")
+                print(f"   Signal price: {signal_price:.4f}")
+                print(f"   Current ask:  {current_ask:.4f}")
+                print(f"   Drift: {price_drift:.4f} (max allowed: {max_drift:.4f})")
+                print(f"   Market moved against us - edge is no longer valid")
+                return False
+            elif price_drift > 0.01 and config.VERBOSE_LOGGING:
+                # Log warning for smaller drift
+                print(f"📊 Price drift since signal: {signal_price:.4f} → {current_ask:.4f} ({price_drift*100:.1f}¢)")
+        
         # Place the order
         result = self.polymarket.place_order(
             market=signal.market,
@@ -595,21 +627,40 @@ class ExecutionEngine:
         order_id = result.get("order_id")
         trade.order_id = order_id
         
+        # IMPORTANT: Update bet_size if it was adjusted to meet minimum share requirements
+        # Polymarket requires minimum 5 shares, so the actual amount may be higher
+        actual_amount = result.get("amount_usd")
+        if actual_amount and actual_amount != trade.bet_size:
+            old_bet_size = trade.bet_size
+            trade.bet_size = actual_amount
+            print(f"📈 Bet size adjusted for minimum shares: ${old_bet_size:.2f} → ${actual_amount:.2f}")
+        
         if config.VERBOSE_LOGGING:
             print(f"📋 Order placed: {order_id}")
             print(f"   Waiting for fill confirmation...")
         
         # Wait for order to be filled
+        # Pass token_id for fallback position checking if order status returns 404
         fill_result = self.polymarket.wait_for_order_fill(
             order_id=order_id,
             max_wait_seconds=config.ORDER_FILL_TIMEOUT if hasattr(config, 'ORDER_FILL_TIMEOUT') else 60,
-            poll_interval=2.0
+            poll_interval=2.0,
+            token_id=trade.token_id
         )
         
         if not fill_result["success"]:
             # Order was not filled - handle failure
             error_msg = fill_result.get("error", "Unknown")
             trade.order_status = fill_result["status"]
+            
+            if fill_result["status"] == "NOT_FOUND":
+                # Order status endpoint returned 404 and no position found
+                # This usually means the limit order wasn't matched (illiquid market)
+                print(f"⚠️ Order not matched - market may be illiquid at quoted price")
+                print(f"   The order was placed but there were no matching counterparties")
+                # Try to cancel the order just in case it's still open
+                self.polymarket.cancel_order(order_id)
+                return False
             
             if fill_result["status"] == "TIMEOUT":
                 # Try to cancel the unfilled order
@@ -621,7 +672,7 @@ class ExecutionEngine:
                     print("⚠️ Could not cancel order - may have filled")
                     # Re-check status
                     final_check = self.polymarket.get_order_status(order_id)
-                    if final_check:
+                    if final_check and not final_check.get("_error"):
                         status = self.polymarket._parse_order_status(final_check)
                         if status in ["FILLED", "MATCHED"]:
                             # Actually it filled!
@@ -1064,11 +1115,11 @@ class ExecutionEngine:
     
     def _redeem_winning_shares(self, trade: Trade) -> Optional[Dict]:
         """
-        Redeem winning shares for a resolved trade.
+        Check winning shares redemption status for a resolved trade.
         
-        After a market resolves in our favor, we hold winning shares
-        that need to be converted back to USDC. This method handles
-        that redemption process.
+        IMPORTANT: Polymarket redemption happens ON-CHAIN via smart contracts,
+        NOT via REST API. This method checks the status and notifies the user
+        if manual redemption is needed.
         
         Args:
             trade: The winning trade with token_id and filled_shares
@@ -1080,14 +1131,20 @@ class ExecutionEngine:
             return {"success": True, "amount_usdc": trade.payout, "simulated": True}
         
         if not trade.token_id:
-            print(f"❌ Cannot redeem: No token ID stored for trade {trade.trade_id}")
+            print(f"❌ Cannot check redemption: No token ID stored for trade {trade.trade_id}")
             return None
         
-        # Use the Polymarket client to redeem shares
+        # Use the Polymarket client to check redemption status
         result = self.polymarket.redeem_winning_shares(
             token_id=trade.token_id,
             shares=trade.filled_shares
         )
+        
+        # Handle the new response format
+        if result and result.get("needs_manual_redemption"):
+            trade.redemption_status = "PENDING_MANUAL"
+            trade.redemption_amount = result.get("amount_usdc", 0)
+            # Don't log error - manual redemption is expected
         
         return result
     

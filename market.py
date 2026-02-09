@@ -158,6 +158,10 @@ class PolymarketClient:
                     time.sleep(2)  # Slightly longer wait for connection issues
                     continue
             except requests.exceptions.HTTPError as e:
+                # Return special dict for 404 errors to allow caller to handle them
+                if response.status_code == 404:
+                    print(f"⚠️ HTTP error 404: {e}")
+                    return {"_error": "not_found", "_status_code": 404}
                 if config.VERBOSE_LOGGING:
                     print(f"⚠️ HTTP error {response.status_code}: {e}")
                 return None
@@ -526,7 +530,11 @@ class PolymarketClient:
                         # Normalize to lowercase for consistency
                         tokens[outcome.lower()] = clob_token_ids[i]
             else:
-                tokens = {"up": f"{slug}-up", "down": f"{slug}-down"}
+                # Don't create fake placeholder tokens - they won't work for trading
+                print(f"⚠️ Could not fetch real token IDs for market: {slug}")
+                if not config.TEST_MODE:
+                    print("   LIVE trading requires real token IDs from Polymarket API")
+                tokens = {}  # Empty tokens will be validated later
             
             return Market(
                 market_id=data.get("id", slug),
@@ -755,7 +763,26 @@ class PolymarketClient:
         url = f"{self.clob_url}/book"
         params = {"token_id": token_id}
         
-        return self._make_request("GET", url, params=params)
+        result = self._make_request("GET", url, params=params)
+        
+        if config.VERBOSE_LOGGING and result:
+            bids = result.get("bids", [])
+            asks = result.get("asks", [])
+            print(f"📖 Orderbook response: {len(bids)} bids, {len(asks)} asks")
+            
+            # Show actual best prices (sorted correctly)
+            if asks:
+                ask_prices = [float(a["price"]) for a in asks]
+                best_ask = min(ask_prices)
+                worst_ask = max(ask_prices)
+                print(f"   Asks range: {best_ask:.4f} (best) to {worst_ask:.4f} (worst)")
+            if bids:
+                bid_prices = [float(b["price"]) for b in bids]
+                best_bid = max(bid_prices)
+                worst_bid = min(bid_prices)
+                print(f"   Bids range: {best_bid:.4f} (best) to {worst_bid:.4f} (worst)")
+        
+        return result
     
     def get_best_prices(self, market: Market, side: str) -> Optional[Dict[str, float]]:
         """
@@ -763,34 +790,138 @@ class PolymarketClient:
         
         Args:
             market: The market to query
-            side: "yes" or "no"
+            side: "yes" or "no" or "up" or "down"
         
         Returns:
             Dict with 'bid', 'ask', 'mid' prices, or None on error
         """
         token_id = market.tokens.get(side.lower())
         if not token_id:
+            print(f"⚠️ No token ID found for side '{side}'. Available: {list(market.tokens.keys())}")
             return None
+        
+        # Check if token_id looks like a real token (not a placeholder)
+        if "-up" in token_id or "-down" in token_id:
+            print(f"⚠️ Invalid token ID (placeholder): {token_id}")
+            print("   Real token IDs should be numeric strings like '79488316806456...'")
+            # Fall back to using market's quoted prices
+            return self._get_fallback_prices(market, side)
         
         orderbook = self.fetch_market_orderbook(token_id)
         if not orderbook:
-            return None
+            print(f"⚠️ Could not fetch order book for token: {token_id[:20]}...")
+            return self._get_fallback_prices(market, side)
         
         try:
             bids = orderbook.get("bids", [])
             asks = orderbook.get("asks", [])
             
-            best_bid = float(bids[0]["price"]) if bids else 0.0
-            best_ask = float(asks[0]["price"]) if asks else 1.0
-            mid = (best_bid + best_ask) / 2
+            if config.VERBOSE_LOGGING:
+                print(f"📖 Order book for {side}: {len(bids)} bids, {len(asks)} asks")
+            
+            # If no asks available, can't place a market buy order
+            if not asks:
+                print(f"⚠️ No asks in order book for {side} - market has no sell-side liquidity")
+                return self._get_fallback_prices(market, side)
+            
+            # ─────────────────────────────────────────────────────────────────
+            # IMPORTANT: Order book sorting
+            # ─────────────────────────────────────────────────────────────────
+            # The CLOB API may return bids/asks in different sort orders.
+            # - Best BID = HIGHEST bid price (someone willing to pay the most)
+            # - Best ASK = LOWEST ask price (someone willing to sell cheapest)
+            # 
+            # We need to sort to find the true best prices.
+            # ─────────────────────────────────────────────────────────────────
+            
+            # Parse all prices and sort to find best ones
+            bid_prices = [float(b["price"]) for b in bids] if bids else [0.0]
+            ask_prices = [float(a["price"]) for a in asks]
+            
+            best_bid = max(bid_prices) if bid_prices else 0.0  # Highest bid
+            best_ask = min(ask_prices)  # Lowest ask
+            
+            if config.VERBOSE_LOGGING:
+                print(f"   Best bid (highest): {best_bid:.4f}")
+                print(f"   Best ask (lowest): {best_ask:.4f}")
+                print(f"   Spread: {(best_ask - best_bid):.4f}")
+            
+            # Validate ask price is reasonable
+            if best_ask <= 0 or best_ask >= 1.0:
+                print(f"⚠️ Invalid ask price: {best_ask}")
+                return self._get_fallback_prices(market, side)
+            
+            # ─────────────────────────────────────────────────────────────────
+            # Check for wide spread (illiquid market)
+            # ─────────────────────────────────────────────────────────────────
+            spread = best_ask - best_bid
+            if spread > 0.50:  # Spread > 50% is not a healthy market
+                side_lower = side.lower()
+                quoted_price = market.yes_price if side_lower in ["up", "yes"] else market.no_price
+                print(f"⚠️ Order book spread too wide ({spread:.2f})")
+                print(f"   Bid: {best_bid:.4f}, Ask: {best_ask:.4f}")
+                print(f"   Quoted market price: {quoted_price:.4f}")
+                
+                # Check if ask price is way off from quoted price (indicates near resolution)
+                price_diff = abs(best_ask - quoted_price)
+                if price_diff > 0.30:  # Ask differs from quoted by more than 30%
+                    print(f"⚠️ Order book ask ({best_ask:.4f}) differs significantly from quoted price ({quoted_price:.4f})")
+                    print("   Market may be near resolution or illiquid - using quoted prices")
+                    return self._get_fallback_prices(market, side)
+            
+            # Calculate mid price - if no bids, use ask as reference
+            if best_bid > 0:
+                mid = (best_bid + best_ask) / 2
+            else:
+                mid = best_ask  # Use ask as mid if no bids
             
             return {
                 "bid": best_bid,
                 "ask": best_ask,
-                "mid": mid
+                "mid": mid,
+                "is_fallback": False  # Real order book prices
             }
-        except (IndexError, KeyError, TypeError):
+        except (IndexError, KeyError, TypeError) as e:
+            print(f"⚠️ Error parsing order book: {e}")
+            return self._get_fallback_prices(market, side)
+    
+    def _get_fallback_prices(self, market: Market, side: str) -> Optional[Dict[str, float]]:
+        """
+        Get fallback prices from the market's quoted prices when order book is unavailable.
+        
+        IMPORTANT: These are INDICATIVE prices only - they may not have real liquidity!
+        Orders placed at these prices may sit unfilled on the order book.
+        
+        The caller should check the 'is_fallback' flag and handle accordingly.
+        """
+        side_lower = side.lower()
+        
+        # Get the quoted price for this side
+        if side_lower in ["up", "yes"]:
+            quoted_price = market.yes_price
+        elif side_lower in ["down", "no"]:
+            quoted_price = market.no_price
+        else:
+            print(f"⚠️ Unknown side for fallback: {side}")
             return None
+        
+        if quoted_price <= 0 or quoted_price >= 1.0:
+            print(f"⚠️ Invalid quoted price for {side}: {quoted_price}")
+            return None
+        
+        print(f"📊 Using quoted market price as fallback: {quoted_price:.4f}")
+        print(f"⚠️ WARNING: Fallback prices may not have real liquidity!")
+        
+        # Use quoted price as both bid and ask (tight spread assumption)
+        # Add small buffer for ask to account for spread
+        ask_price = min(quoted_price * 1.005, 0.99)  # 0.5% buffer
+        
+        return {
+            "bid": quoted_price,
+            "ask": ask_price,
+            "mid": quoted_price,
+            "is_fallback": True,  # Flag to indicate these are fallback prices
+        }
     
     def place_order(
         self,
@@ -847,6 +978,13 @@ class PolymarketClient:
             print(f"   Available tokens: {list(market.tokens.keys())}")
             return None
         
+        # Validate token ID is a real token (not a placeholder)
+        if not token_id.isdigit() or len(token_id) < 10:
+            print(f"❌ Invalid token ID format: {token_id}")
+            print("   Real token IDs should be long numeric strings (e.g., '79488316806456...')")
+            print("   This usually means the Polymarket API didn't return real token IDs.")
+            return None
+        
         # Validate amount
         if amount_usd <= 0:
             print(f"❌ Invalid order amount: ${amount_usd}")
@@ -866,10 +1004,31 @@ class PolymarketClient:
             print("❌ Could not fetch current market prices")
             return None
         
+        # ─────────────────────────────────────────────────────────────────────
+        # REJECT ORDERS WITH FALLBACK PRICES (NO REAL LIQUIDITY)
+        # ─────────────────────────────────────────────────────────────────────
+        # If we're using fallback prices (from wide-spread order book), the order
+        # will likely sit unfilled on the book. Better to skip this market.
+        if prices.get("is_fallback"):
+            print("❌ Market has no executable liquidity at quoted price")
+            print("   Order book spread is too wide - cannot guarantee fill")
+            print("   Skipping this market to avoid unfilled orders")
+            return None
+        
         # Calculate order price with slippage protection
         order_price = self._calculate_order_price(prices, max_slippage_percent)
         if order_price is None:
             print("❌ Could not calculate valid order price")
+            return None
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # MAX BUY PRICE CHECK - Reject orders above configured threshold
+        # ─────────────────────────────────────────────────────────────────────
+        max_buy_price = getattr(config, 'MAX_BUY_PRICE', 0.57)
+        if order_price > max_buy_price:
+            print(f"❌ Order price ${order_price:.4f} exceeds MAX_BUY_PRICE ${max_buy_price:.2f}")
+            print(f"   Skipping trade to avoid buying at high prices")
+            print(f"   Adjust MAX_BUY_PRICE in config.py or .env if you want to allow higher prices")
             return None
         
         # Calculate number of shares to buy
@@ -877,69 +1036,119 @@ class PolymarketClient:
         shares = amount_usd / order_price
         
         # Round shares to reasonable precision (Polymarket uses 2 decimals typically)
-        shares = round(shares, 4)
+        shares = round(shares, 2)
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # POLYMARKET MINIMUM ORDER SIZE: 5 SHARES
+        # ─────────────────────────────────────────────────────────────────────
+        MIN_SHARES = 5.0
+        if shares < MIN_SHARES:
+            # Calculate the minimum USD needed to meet the 5 share minimum
+            min_usd_needed = MIN_SHARES * order_price
+            print(f"⚠️ Order size ({shares:.2f} shares) below minimum ({MIN_SHARES} shares)")
+            print(f"   Need at least ${min_usd_needed:.2f} at price {order_price:.4f}")
+            
+            # Check if we can afford the minimum (within reason - up to 3x intended or $5, whichever is higher)
+            max_allowed = max(amount_usd * 3, 5.0)  # Allow up to 3x or $5 minimum
+            if min_usd_needed <= max_allowed:
+                # Increase to minimum if affordable
+                shares = MIN_SHARES
+                amount_usd = min_usd_needed
+                print(f"   📈 Increasing order to minimum: {shares:.2f} shares (${amount_usd:.2f})")
+            else:
+                print(f"❌ Cannot meet minimum order size - need ${min_usd_needed:.2f} (max allowed: ${max_allowed:.2f})")
+                return None
         
         if shares <= 0:
             print(f"❌ Invalid share calculation: {shares}")
             return None
         
-        # Generate unique nonce for replay protection
-        nonce = int(time.time() * 1000)
-        
-        # Build order data
-        order_data = {
-            "token_id": token_id,
-            "side": "BUY",
-            "size": str(shares),
-            "price": str(round(order_price, 4)),
-            "nonce": nonce,
-            "expiration": 0,  # No expiration (GTC)
-            "order_type": "GTC",
-        }
-        
-        # Sign the order using L2 auth
+        # ─────────────────────────────────────────────────────────────────────
+        # USE OFFICIAL py-clob-client FOR ORDER CREATION AND SUBMISSION
+        # ─────────────────────────────────────────────────────────────────────
         try:
-            signature = self._auth.sign_order(order_data)
-            order_data["signature"] = signature
-        except AuthError as e:
-            print(f"❌ Failed to sign order: {e}")
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+            from py_clob_client.constants import POLYGON
+            
+            # Initialize the official CLOB client
+            creds = ApiCreds(
+                api_key=config.POLYMARKET_API_KEY,
+                api_secret=config.POLYMARKET_API_SECRET,
+                api_passphrase=config.POLYMARKET_PASSPHRASE,
+            )
+            
+            clob_client = ClobClient(
+                host=self.clob_url,
+                key=config.WALLET_PRIVATE_KEY,
+                chain_id=POLYGON,
+                creds=creds,
+            )
+            
+            # Log order details before submission
+            if config.VERBOSE_LOGGING:
+                print(f"📤 Submitting order via py-clob-client:")
+                print(f"   Token: {token_id[:16]}...")
+                print(f"   Side: BUY {side.upper()}")
+                print(f"   Amount: ${amount_usd:.2f}")
+                print(f"   Price: {order_price:.4f}")
+                print(f"   Shares: {shares:.2f}")
+            
+            # Create the order using the official client
+            order_args = OrderArgs(
+                price=round(order_price, 2),  # Price must be rounded to tick size
+                size=shares,
+                side="BUY",  # We're always buying the outcome we want
+                token_id=token_id,
+            )
+            
+            # Create and sign the order
+            signed_order = clob_client.create_order(order_args)
+            
+            # Post the order to the CLOB
+            result = clob_client.post_order(signed_order, orderType=OrderType.GTC)
+            
+            if config.VERBOSE_LOGGING:
+                print(f"📥 Order response: {result}")
+            
+            # Parse the response
+            if result and isinstance(result, dict):
+                if result.get("success") or result.get("orderID") or result.get("order_id"):
+                    order_id = result.get("orderID") or result.get("order_id") or result.get("id")
+                    print(f"✅ Order placed successfully!")
+                    print(f"   Order ID: {order_id}")
+                    self.mark_as_traded(market)
+                    return {
+                        "success": True,
+                        "order_id": order_id,
+                        "status": result.get("status", "SUBMITTED"),
+                        "amount_usd": amount_usd,
+                        "price": order_price,
+                        "shares": shares,
+                        "raw_response": result,
+                    }
+                else:
+                    error_msg = result.get("error") or result.get("message") or str(result)
+                    print(f"❌ Order placement failed: {error_msg}")
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "raw_response": result,
+                    }
+            else:
+                print(f"❌ Unexpected response format: {result}")
+                return None
+                
+        except ImportError as e:
+            print(f"❌ py-clob-client not installed: {e}")
+            print("   Install with: pip install py-clob-client")
             return None
-        
-        # Add wallet address
-        wallet_address = self._auth.get_wallet_address()
-        if wallet_address:
-            order_data["maker"] = wallet_address
-        
-        # Log order details before submission
-        if config.VERBOSE_LOGGING:
-            print(f"📤 Submitting order:")
-            print(f"   Token: {token_id[:16]}...")
-            print(f"   Side: BUY {side.upper()}")
-            print(f"   Amount: ${amount_usd:.2f}")
-            print(f"   Price: {order_price:.4f}")
-            print(f"   Shares: {shares:.4f}")
-        
-        # Submit order to CLOB
-        url = f"{self.clob_url}/order"
-        result = self._make_request("POST", url, data=order_data, authenticated=True)
-        
-        if result is None:
-            print("❌ Order submission failed - no response from API")
+        except Exception as e:
+            print(f"❌ Order submission error: {e}")
+            if config.VERBOSE_LOGGING:
+                import traceback
+                traceback.print_exc()
             return None
-        
-        # Parse and validate response
-        order_result = self._parse_order_response(result, order_data, amount_usd)
-        
-        if order_result and order_result.get("success"):
-            print(f"✅ Order placed successfully!")
-            print(f"   Order ID: {order_result.get('order_id', 'N/A')}")
-            print(f"   Status: {order_result.get('status', 'N/A')}")
-            self.mark_as_traded(market)
-        else:
-            error_msg = order_result.get("error", "Unknown error") if order_result else "No response"
-            print(f"❌ Order placement failed: {error_msg}")
-        
-        return order_result
     
     def _normalize_side(self, side: str) -> str:
         """
@@ -1145,17 +1354,20 @@ class PolymarketClient:
         self,
         order_id: str,
         max_wait_seconds: int = 60,
-        poll_interval: float = 2.0
+        poll_interval: float = 2.0,
+        token_id: Optional[str] = None
     ) -> Dict:
         """
         Wait for an order to be filled, with timeout.
         
         Polls the order status until it's filled, cancelled, or timeout.
+        Falls back to checking positions if order status endpoint returns 404.
         
         Args:
             order_id: The order ID to monitor
             max_wait_seconds: Maximum time to wait for fill
             poll_interval: Time between status checks
+            token_id: Optional token ID to check positions as fallback
             
         Returns:
             Dict with:
@@ -1187,10 +1399,66 @@ class PolymarketClient:
         
         start_time = time.time()
         last_status = None
+        consecutive_404s = 0
+        max_consecutive_404s = 5  # After 5 consecutive 404s, try alternate methods
         
         while (time.time() - start_time) < max_wait_seconds:
             try:
                 status_data = self.get_order_status(order_id)
+                
+                # Handle 404 errors specifically
+                if status_data is not None and status_data.get("_error") == "not_found":
+                    consecutive_404s += 1
+                    if consecutive_404s >= max_consecutive_404s:
+                        print(f"⚠️ Order status endpoint returning 404 consistently")
+                        # NOTE: Polymarket order status API often returns 404 for orders that
+                        # actually filled. This is a known issue. We MUST check positions
+                        # with retries and delays to account for data API propagation time.
+                        if token_id:
+                            print(f"   Checking positions for token {token_id[:16]}...")
+                            print(f"   (Note: Data API may have a 5-15 second propagation delay)")
+                            # Use multiple retries with delays - positions often take time to appear
+                            filled = self._check_position_for_fill(token_id, retries=5, delay_seconds=3.0)
+                            if filled:
+                                print(f"✅ Found position - order appears to have filled!")
+                                return {
+                                    "success": True,
+                                    "status": "FILLED_VIA_POSITION",
+                                    "filled_price": filled.get("avg_price", 0.0),
+                                    "filled_shares": filled.get("size", 0.0),
+                                    "order_id": order_id,
+                                    "error": None
+                                }
+                        # If no position found after extensive retries, check user's trade history
+                        # as another fallback
+                        print(f"⚠️ No position found via data API - checking trade history...")
+                        if token_id:
+                            trade_found = self._check_trades_for_fill(token_id)
+                            if trade_found:
+                                print(f"✅ Found trade in history - order appears to have filled!")
+                                return {
+                                    "success": True,
+                                    "status": "FILLED_VIA_TRADES",
+                                    "filled_price": trade_found.get("price", 0.0),
+                                    "filled_shares": trade_found.get("size", 0.0),
+                                    "order_id": order_id,
+                                    "error": None
+                                }
+                        # If still no position found, the order likely wasn't matched
+                        print(f"⚠️ No position or trade found - order may not have been matched")
+                        return {
+                            "success": False,
+                            "status": "NOT_FOUND",
+                            "filled_price": 0.0,
+                            "filled_shares": 0.0,
+                            "order_id": order_id,
+                            "error": "Order not found - likely not matched (illiquid market)"
+                        }
+                    time.sleep(poll_interval)
+                    continue
+                
+                # Reset 404 counter if we get a valid response
+                consecutive_404s = 0
                 
                 if status_data is None:
                     print(f"⚠️ Could not fetch order status, retrying...")
@@ -1248,7 +1516,7 @@ class PolymarketClient:
         
         # Try one final status check
         final_status = self.get_order_status(order_id)
-        if final_status:
+        if final_status and not final_status.get("_error"):
             status = self._parse_order_status(final_status)
             if status in ["FILLED", "MATCHED"]:
                 fill_info = self._extract_fill_info(final_status)
@@ -1257,6 +1525,34 @@ class PolymarketClient:
                     "status": status,
                     "filled_price": fill_info["filled_price"],
                     "filled_shares": fill_info["filled_shares"],
+                    "order_id": order_id,
+                    "error": None
+                }
+        
+        # Final fallback: check positions with extended retries
+        if token_id:
+            print(f"   Final check: looking for position with extended wait...")
+            filled = self._check_position_for_fill(token_id, retries=3, delay_seconds=3.0)
+            if filled:
+                print(f"✅ Found position in final check - order filled!")
+                return {
+                    "success": True,
+                    "status": "FILLED_VIA_POSITION",
+                    "filled_price": filled.get("avg_price", 0.0),
+                    "filled_shares": filled.get("size", 0.0),
+                    "order_id": order_id,
+                    "error": None
+                }
+            
+            # Also try trade history as last resort
+            trade_found = self._check_trades_for_fill(token_id)
+            if trade_found:
+                print(f"✅ Found trade in history in final check - order filled!")
+                return {
+                    "success": True,
+                    "status": "FILLED_VIA_TRADES",
+                    "filled_price": trade_found.get("price", 0.0),
+                    "filled_shares": trade_found.get("size", 0.0),
                     "order_id": order_id,
                     "error": None
                 }
@@ -1330,6 +1626,122 @@ class PolymarketClient:
             "filled_shares": filled_shares
         }
     
+    def _check_position_for_fill(self, token_id: str, retries: int = 3, delay_seconds: float = 2.0) -> Optional[Dict]:
+        """
+        Check if we have a position for the given token, indicating a filled order.
+        
+        This is a fallback method when the order status endpoint returns 404.
+        If we have shares of the token, the order must have filled.
+        
+        NOTE: The data API can have a delay before showing new positions.
+        We retry with increasing delays to account for this propagation delay.
+        
+        Args:
+            token_id: The token ID to look for in positions
+            retries: Number of times to retry if position not found (default 3)
+            delay_seconds: Base delay between retries (increases each retry)
+            
+        Returns:
+            Position dict if found, None otherwise
+        """
+        for attempt in range(retries):
+            try:
+                # Wait before checking (longer delay on subsequent attempts)
+                if attempt > 0:
+                    wait_time = delay_seconds * (attempt + 1)
+                    if config.VERBOSE_LOGGING:
+                        print(f"   Waiting {wait_time:.1f}s for position data to propagate (attempt {attempt + 1}/{retries})...")
+                    time.sleep(wait_time)
+                
+                positions = self.get_open_positions()
+                if not positions:
+                    continue
+                
+                for pos in positions:
+                    # Check various possible field names for token ID
+                    pos_token = (
+                        pos.get("token_id") or 
+                        pos.get("tokenId") or 
+                        pos.get("asset") or
+                        ""
+                    )
+                    
+                    # Debug log to help diagnose token ID mismatches
+                    if config.VERBOSE_LOGGING and attempt == retries - 1:
+                        # On last attempt, show what tokens we found
+                        print(f"   Position token: {pos_token[:20] if pos_token else 'None'}... size: {pos.get('size', 0)}")
+                    
+                    if pos_token == token_id:
+                        size = float(pos.get("size") or pos.get("shares") or 0)
+                        if size > 0:
+                            if config.VERBOSE_LOGGING:
+                                print(f"   ✓ Found matching position with {size} shares")
+                            return pos
+                
+            except Exception as e:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ Error checking position (attempt {attempt + 1}): {e}")
+                continue
+        
+        return None
+    
+    def _check_trades_for_fill(self, token_id: str) -> Optional[Dict]:
+        """
+        Check user's recent trades as a fallback to verify if an order was filled.
+        
+        This is a secondary fallback when both order status API returns 404
+        and the positions data API doesn't show the position yet.
+        
+        Args:
+            token_id: The token ID to look for in recent trades
+            
+        Returns:
+            Trade dict if found, None otherwise
+        """
+        try:
+            # Use the data-api trades endpoint
+            wallet_address = config.WALLET_ADDRESS
+            if not wallet_address:
+                return None
+            
+            data_api_url = "https://data-api.polymarket.com"
+            url = f"{data_api_url}/trades"
+            params = {
+                "user": wallet_address.lower(),
+                "limit": 20,  # Check last 20 trades
+            }
+            
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            trades = response.json()
+            
+            if not isinstance(trades, list):
+                trades = trades.get("trades", []) if isinstance(trades, dict) else []
+            
+            # Look for a recent trade with our token
+            for trade in trades:
+                trade_token = (
+                    trade.get("asset") or 
+                    trade.get("token_id") or 
+                    trade.get("tokenId") or
+                    ""
+                )
+                if trade_token == token_id:
+                    # Found a matching trade!
+                    return {
+                        "token_id": trade_token,
+                        "size": float(trade.get("size") or trade.get("amount") or 0),
+                        "price": float(trade.get("price") or 0),
+                        "timestamp": trade.get("timestamp") or trade.get("createdAt"),
+                    }
+            
+            return None
+            
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Error checking trades: {e}")
+            return None
+    
     def cancel_order_if_unfilled(
         self,
         order_id: str,
@@ -1381,12 +1793,70 @@ class PolymarketClient:
         if config.TEST_MODE:
             return None
         
-        # This would query the user's positions
-        # Implementation depends on Polymarket API structure
-        url = f"{self.clob_url}/positions"
-        params = {"market": market.condition_id}
+        # Get all positions and filter for this market
+        positions = self.get_open_positions()
         
-        return self._make_request("GET", url, params=params, authenticated=True)
+        if not positions:
+            return None
+        
+        # Look for position matching this market's tokens
+        for pos in positions:
+            token_id = pos.get("token_id")
+            if token_id and hasattr(market, 'tokens') and market.tokens:
+                if token_id in market.tokens.values():
+                    return pos
+            # Also check by condition_id/market_id
+            if pos.get("market_id") == market.condition_id:
+                return pos
+        
+        return None
+
+    def get_user_trades(self, limit: int = 50, market: Optional[str] = None) -> List[Dict]:
+        """
+        Get user's trade history from the CLOB API.
+        
+        Args:
+            limit: Maximum number of trades to return
+            market: Optional condition_id to filter by market
+            
+        Returns:
+            List of trade dicts
+        """
+        if config.TEST_MODE:
+            return []
+        
+        if not self._auth.is_ready(AuthLevel.L2):
+            print("❌ Cannot fetch trades: L2 authentication required")
+            return []
+        
+        try:
+            url = f"{self.clob_url}/data/trades"
+            
+            # Build headers for authenticated request
+            headers = self._auth.get_l2_headers("GET", "/data/trades")
+            
+            params = {}
+            if market:
+                params["market"] = market
+            
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            trades = []
+            
+            # Handle paginated response
+            if isinstance(result, dict):
+                trades = result.get("data", [])
+            elif isinstance(result, list):
+                trades = result
+            
+            # Limit results
+            return trades[:limit] if len(trades) > limit else trades
+            
+        except Exception as e:
+            print(f"⚠️ Error fetching user trades: {e}")
+            return []
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # BALANCE & ACCOUNT METHODS (LIVE MODE)
@@ -1592,6 +2062,10 @@ class PolymarketClient:
         This retrieves all tokens/shares currently held in the account,
         including unredeemed winning positions.
         
+        NOTE: Uses the Polymarket data-api for positions (not CLOB API).
+        The data-api provides comprehensive position data including
+        P&L, redeemable status, and market metadata.
+        
         Returns:
             List of position dicts with token_id, size, market info, etc.
             Returns None on error, empty list if no positions.
@@ -1609,35 +2083,155 @@ class PolymarketClient:
             return None
         
         try:
-            url = f"{self.clob_url}/positions"
-            result = self._make_request("GET", url, authenticated=True)
-            
-            if result is None:
+            # Use Polymarket data-api for positions - this is the correct endpoint
+            # The CLOB API does NOT have a /positions endpoint
+            wallet_address = config.WALLET_ADDRESS
+            if not wallet_address:
+                print("❌ WALLET_ADDRESS not configured")
                 return None
+            
+            # Data API endpoint for user positions
+            data_api_url = "https://data-api.polymarket.com"
+            url = f"{data_api_url}/positions"
+            params = {"user": wallet_address.lower()}
+            
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            result = response.json()
             
             positions = []
             
-            # Handle different response formats
+            # Handle the data-api response format
             if isinstance(result, list):
                 for item in result:
                     if isinstance(item, dict):
-                        positions.append(self._parse_position(item))
+                        parsed = self._parse_data_api_position(item)
+                        # Only include positions with actual shares
+                        if parsed.get("size", 0) > 0:
+                            positions.append(parsed)
             elif isinstance(result, dict):
-                # Single position or wrapped response
                 if "positions" in result:
                     for item in result["positions"]:
-                        positions.append(self._parse_position(item))
-                else:
-                    positions.append(self._parse_position(result))
+                        parsed = self._parse_data_api_position(item)
+                        if parsed.get("size", 0) > 0:
+                            positions.append(parsed)
             
-            if config.VERBOSE_LOGGING and positions:
-                print(f"📋 Found {len(positions)} open positions")
+            if config.VERBOSE_LOGGING:
+                if positions:
+                    print(f"📋 Found {len(positions)} open positions")
+                    # Count winning vs losing positions based on current_price
+                    winning = [p for p in positions if p.get("current_price", 0) >= 0.90]
+                    losing = [p for p in positions if p.get("current_price", 0) < 0.10]
+                    pending = [p for p in positions if 0.10 <= p.get("current_price", 0) < 0.90]
+                    if winning:
+                        print(f"   💰 {len(winning)} WINNING positions to redeem!")
+                    if losing:
+                        print(f"   ❌ {len(losing)} LOSING positions (no value)")
+                    if pending:
+                        print(f"   ⏳ {len(pending)} positions still pending")
+                else:
+                    print("ℹ️ No open positions found")
+            
+            return positions
+            
+        except requests.exceptions.HTTPError as e:
+            # Try alternate method if data-api fails
+            print(f"⚠️ Data API positions endpoint error: {e}")
+            return self._get_positions_from_trades()
+        except Exception as e:
+            print(f"❌ Error fetching positions: {e}")
+            return self._get_positions_from_trades()
+    
+    def _parse_data_api_position(self, data: Dict) -> Dict:
+        """
+        Parse a position from the data-api response format.
+        
+        The data-api provides rich position data including P&L and redeemable status.
+        
+        Args:
+            data: Raw position data from data-api
+            
+        Returns:
+            Standardized position dict
+        """
+        return {
+            "token_id": data.get("asset"),
+            "size": float(data.get("size") or 0),
+            "avg_price": float(data.get("avgPrice") or 0),
+            "market_id": data.get("conditionId"),
+            "condition_id": data.get("conditionId"),  # Also store as condition_id for redemption
+            "side": data.get("outcome"),
+            "title": data.get("title"),
+            "slug": data.get("slug"),
+            "current_price": float(data.get("curPrice") or 0),
+            "current_value": float(data.get("currentValue") or 0),
+            "initial_value": float(data.get("initialValue") or 0),
+            "cash_pnl": float(data.get("cashPnl") or 0),
+            "percent_pnl": float(data.get("percentPnl") or 0),
+            "redeemable": data.get("redeemable", False),
+            "end_date": data.get("endDate"),
+            "raw": data  # Keep raw data for debugging
+        }
+    
+    def _get_positions_from_trades(self) -> List[Dict]:
+        """
+        Fallback method to get positions by checking recent trades.
+        
+        If the Gamma API positions endpoint doesn't work, we can
+        derive positions from trade history + balance checks.
+        
+        Returns:
+            List of position dicts
+        """
+        try:
+            # Get recent trades from CLOB API
+            trades = self.get_user_trades(limit=50)
+            
+            if not trades:
+                return []
+            
+            # Group by token_id and calculate net position
+            positions_map = {}
+            
+            for trade in trades:
+                token_id = trade.get("asset_id") or trade.get("token_id")
+                if not token_id:
+                    continue
+                
+                side = trade.get("side", "").upper()
+                size = float(trade.get("size") or trade.get("amount") or 0)
+                price = float(trade.get("price") or 0)
+                
+                if token_id not in positions_map:
+                    positions_map[token_id] = {
+                        "token_id": token_id,
+                        "size": 0,
+                        "avg_price": 0,
+                        "total_cost": 0,
+                        "market_id": trade.get("market") or trade.get("condition_id"),
+                    }
+                
+                # Adjust position based on trade side
+                if side == "BUY":
+                    positions_map[token_id]["size"] += size
+                    positions_map[token_id]["total_cost"] += size * price
+                elif side == "SELL":
+                    positions_map[token_id]["size"] -= size
+            
+            # Calculate average prices and filter out zero positions
+            positions = []
+            for token_id, pos in positions_map.items():
+                if pos["size"] > 0.001:  # Small threshold to avoid dust
+                    if pos["size"] > 0:
+                        pos["avg_price"] = pos["total_cost"] / pos["size"]
+                    del pos["total_cost"]
+                    positions.append(pos)
             
             return positions
             
         except Exception as e:
-            print(f"❌ Error fetching positions: {e}")
-            return None
+            print(f"⚠️ Error getting positions from trades: {e}")
+            return []
     
     def _parse_position(self, data: Dict) -> Dict:
         """
@@ -1691,31 +2285,30 @@ class PolymarketClient:
         max_retries: int = 3
     ) -> Optional[Dict]:
         """
-        Redeem winning shares for USDC after market resolution.
+        Redeem winning shares on-chain via the CTF (Conditional Token Framework) contract.
         
-        CRITICAL: Polymarket does NOT automatically credit winnings.
-        After a market resolves, winning shares must be explicitly
-        redeemed to convert them back to USDC.
+        After a market resolves, winning shares can be redeemed for USDC by calling
+        the `redeemPositions` function on the CTF contract. This burns the conditional
+        tokens and returns the underlying USDC collateral.
         
         Args:
             token_id: The token ID of the winning position
-            shares: Number of shares to redeem (None = all available)
+            shares: Number of shares to redeem (ignored - all shares are redeemed)
             max_retries: Number of retry attempts on failure
             
         Returns:
-            Dict with redemption info on success:
+            Dict with redemption info:
             {
                 "success": True,
-                "amount_usdc": float,  # Amount credited
+                "amount_usdc": float,
                 "shares_redeemed": float,
-                "tx_hash": str (if available)
+                "tx_hash": str (if on-chain redemption successful)
             }
-            Returns None on failure.
             
         Example:
             >>> result = client.redeem_winning_shares("abc123", shares=10.5)
             >>> if result and result["success"]:
-            ...     print(f"Redeemed ${result['amount_usdc']:.2f}")
+            ...     print(f"Redeemed! TX: {result.get('tx_hash')}")
         """
         if config.TEST_MODE:
             return {
@@ -1725,181 +2318,267 @@ class PolymarketClient:
                 "simulated": True
             }
         
-        if not self._auth.is_ready(AuthLevel.L2):
-            print("❌ Cannot redeem: L2 authentication (wallet) required")
-            return None
-        
         if not token_id:
             print("❌ Cannot redeem: No token ID provided")
             return None
         
-        # If shares not specified, get current position
-        if shares is None:
-            position = self.get_position_for_token(token_id)
-            if position:
-                shares = position.get("size", 0)
-            else:
-                # Try to redeem anyway - API might know the balance
-                shares = 0  # Will be filled by API
+        # Get current position status
+        position = self.get_position_for_token(token_id)
         
-        if shares is not None and shares <= 0:
+        if position is None or position.get("size", 0) == 0:
+            # Position is gone - already redeemed or never existed
             if config.VERBOSE_LOGGING:
-                print("ℹ️ No shares to redeem (already redeemed or zero balance)")
+                print("ℹ️ Position already redeemed or no longer held")
+            return {
+                "success": True,
+                "amount_usdc": shares or 0,
+                "shares_redeemed": shares or 0,
+                "method": "already_redeemed",
+                "message": "Position no longer held - likely already redeemed"
+            }
+        
+        # Position still exists - check if market is resolved
+        current_shares = position.get("size", 0)
+        cur_price = position.get("current_price", 0)
+        condition_id = position.get("condition_id") or position.get("market_id")
+        
+        # If current price is 0.0, it's a losing position (no redemption needed)
+        if cur_price == 0:
             return {
                 "success": True,
                 "amount_usdc": 0,
                 "shares_redeemed": 0,
-                "message": "No shares to redeem"
+                "method": "losing_position",
+                "message": "Losing position - no redemption value"
             }
         
-        # Attempt redemption with retries
-        for attempt in range(max_retries):
-            try:
-                result = self._execute_redemption(token_id, shares)
-                
-                if result and result.get("success"):
-                    return result
-                
-                if attempt < max_retries - 1:
-                    print(f"⚠️ Redemption attempt {attempt + 1} failed, retrying...")
-                    time.sleep(2)
-                    
-            except Exception as e:
-                print(f"❌ Redemption error (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
+        # If current price is 1.0, it's a winning position - attempt on-chain redemption
+        if cur_price == 1.0 or cur_price >= 0.99:
+            estimated_value = current_shares * 1.0
+            print(f"💰 Winning position found: {current_shares:.4f} shares (~${estimated_value:.2f})")
+            
+            # Try on-chain redemption
+            if condition_id:
+                for attempt in range(max_retries):
+                    try:
+                        result = self._execute_onchain_redemption(condition_id, token_id, current_shares)
+                        if result and result.get("success"):
+                            return result
+                        if attempt < max_retries - 1:
+                            print(f"⚠️ Redemption attempt {attempt + 1} failed, retrying in 15s...")
+                            time.sleep(15)  # Longer delay to avoid rate limits
+                    except Exception as e:
+                        print(f"❌ Redemption error (attempt {attempt + 1}): {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(15)  # Longer delay to avoid rate limits
+            
+            # If on-chain redemption failed, notify user
+            print(f"   ℹ️ Automatic redemption failed. Please redeem manually.")
+            print(f"   👉 Visit: https://polymarket.com/portfolio")
+            
+            return {
+                "success": True,  # Not a failure, just needs manual action
+                "amount_usdc": estimated_value,
+                "shares_redeemed": 0,  # Not actually redeemed yet
+                "needs_manual_redemption": True,
+                "method": "manual_required",
+                "message": f"Please redeem ${estimated_value:.2f} at polymarket.com/portfolio"
+            }
         
-        print(f"❌ Redemption failed after {max_retries} attempts")
-        return None
+        # Position exists with non-conclusive price - market may not be resolved yet
+        return {
+            "success": True,
+            "amount_usdc": 0,
+            "shares_redeemed": 0,
+            "method": "market_not_resolved",
+            "message": f"Market may not be resolved yet (price: {cur_price})"
+        }
+    
+    def _execute_onchain_redemption(
+        self, 
+        condition_id: str, 
+        token_id: str,
+        shares: float
+    ) -> Optional[Dict]:
+        """
+        Execute on-chain redemption via the CTF contract.
+        
+        Calls `redeemPositions` on the Conditional Token Framework (CTF) contract
+        to burn winning outcome tokens and receive USDC collateral.
+        
+        Args:
+            condition_id: The condition ID of the resolved market
+            token_id: The token ID (used for logging)
+            shares: Number of shares being redeemed
+            
+        Returns:
+            Dict with redemption result including tx_hash on success
+        """
+        try:
+            from web3 import Web3
+            from web3.middleware import ExtraDataToPOAMiddleware
+            import os
+            
+            # Contract addresses (Polygon Mainnet)
+            CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+            USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            
+            # CTF redeemPositions ABI
+            CTF_ABI = [
+                {
+                    "inputs": [
+                        {"name": "collateralToken", "type": "address"},
+                        {"name": "parentCollectionId", "type": "bytes32"},
+                        {"name": "conditionId", "type": "bytes32"},
+                        {"name": "indexSets", "type": "uint256[]"}
+                    ],
+                    "name": "redeemPositions",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function"
+                }
+            ]
+            
+            # Get wallet credentials
+            private_key = os.getenv("WALLET_PRIVATE_KEY")
+            wallet_address = os.getenv("WALLET_ADDRESS")
+            
+            if not private_key or not wallet_address:
+                print("❌ Cannot redeem: WALLET_PRIVATE_KEY and WALLET_ADDRESS required")
+                return None
+            
+            # Connect to Polygon
+            rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+            web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
+            web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            
+            if not web3.is_connected():
+                print("❌ Cannot redeem: Failed to connect to Polygon network")
+                return None
+            
+            wallet_address = web3.to_checksum_address(wallet_address)
+            
+            # Create CTF contract instance
+            ctf_contract = web3.eth.contract(
+                address=web3.to_checksum_address(CTF_ADDRESS),
+                abi=CTF_ABI
+            )
+            
+            # Format condition_id as bytes32
+            # If it starts with 0x, use as-is; otherwise, pad it
+            if condition_id.startswith("0x"):
+                condition_id_bytes = bytes.fromhex(condition_id[2:].zfill(64))
+            else:
+                condition_id_bytes = bytes.fromhex(condition_id.zfill(64))
+            
+            # Parent collection ID is null (bytes32 zero) for Polymarket
+            parent_collection_id = bytes(32)
+            
+            # Index sets: [1, 2] represents YES and NO outcomes
+            # The contract will only pay out for winning outcomes
+            index_sets = [1, 2]
+            
+            print(f"   🔗 Executing on-chain redemption...")
+            print(f"      Condition ID: {condition_id[:16]}...")
+            print(f"      Shares: {shares:.4f}")
+            
+            # Build transaction
+            nonce = web3.eth.get_transaction_count(wallet_address)
+            gas_price = web3.eth.gas_price
+            
+            tx = ctf_contract.functions.redeemPositions(
+                web3.to_checksum_address(USDC_ADDRESS),
+                parent_collection_id,
+                condition_id_bytes,
+                index_sets
+            ).build_transaction({
+                'from': wallet_address,
+                'nonce': nonce,
+                'gas': 200000,  # Estimate, will be adjusted
+                'gasPrice': gas_price,
+                'chainId': 137  # Polygon Mainnet
+            })
+            
+            # Estimate gas
+            try:
+                gas_estimate = web3.eth.estimate_gas(tx)
+                tx['gas'] = int(gas_estimate * 1.2)  # Add 20% buffer
+            except Exception as e:
+                print(f"   ⚠️ Gas estimation failed: {e}")
+                # Continue with default gas
+            
+            # Sign and send transaction
+            signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+            
+            print(f"   📤 Transaction sent: {tx_hash_hex}")
+            print(f"   ⏳ Waiting for confirmation...")
+            
+            # Wait for transaction receipt
+            receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            
+            if receipt['status'] == 1:
+                print(f"   ✅ Redemption successful!")
+                print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
+                
+                return {
+                    "success": True,
+                    "amount_usdc": shares,  # Winning shares = USDC
+                    "shares_redeemed": shares,
+                    "method": "onchain_redemption",
+                    "tx_hash": tx_hash_hex,
+                    "gas_used": receipt['gasUsed']
+                }
+            else:
+                print(f"   ❌ Transaction failed (reverted)")
+                return None
+                
+        except ImportError:
+            print("❌ web3 package not installed. Install with: pip install web3")
+            return None
+        except Exception as e:
+            print(f"❌ On-chain redemption error: {e}")
+            return None
     
     def _execute_redemption(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
         """
-        Execute the actual redemption API call.
+        DEPRECATED: Polymarket redemption is on-chain, not via API.
         
-        Polymarket's redemption can work in different ways:
-        1. Direct redemption endpoint
-        2. Claiming via condition ID
-        3. Automatic redemption on market close
-        
-        This method tries multiple approaches.
+        This method is kept for backwards compatibility but now just
+        redirects to the position check logic.
         
         Args:
-            token_id: Token to redeem
-            shares: Number of shares (None = all)
+            token_id: Token to check
+            shares: Number of shares
             
         Returns:
-            Redemption result dict or None
+            Result dict indicating manual redemption is needed
         """
-        result = {
-            "success": False,
-            "amount_usdc": 0,
-            "shares_redeemed": 0,
-            "method": None
-        }
-        
-        # Method 1: Try the redeem endpoint
-        redemption_result = self._try_redeem_endpoint(token_id, shares)
-        if redemption_result:
-            return redemption_result
-        
-        # Method 2: Try the claim endpoint
-        claim_result = self._try_claim_endpoint(token_id, shares)
-        if claim_result:
-            return claim_result
-        
-        # Method 3: Check if auto-redeemed (balance should reflect it)
-        # Some markets auto-redeem on resolution
-        auto_result = self._check_auto_redemption(token_id, shares)
-        if auto_result:
-            return auto_result
-        
-        return None
+        # Just check if position still exists
+        return self._check_auto_redemption(token_id, shares)
     
     def _try_redeem_endpoint(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
         """
-        Try to redeem via the /redeem endpoint.
+        DEPRECATED: The /redeem endpoint does not exist in Polymarket CLOB API.
+        Redemption happens on-chain via smart contracts.
+        
+        This method is kept for backwards compatibility but always returns None.
         """
-        try:
-            url = f"{self.clob_url}/redeem"
-            
-            redeem_data = {
-                "token_id": token_id,
-            }
-            
-            if shares is not None and shares > 0:
-                redeem_data["amount"] = str(shares)
-            
-            # Sign the redemption request
-            try:
-                signature = self._auth.sign_order({
-                    "token_id": token_id,
-                    "side": "REDEEM",
-                    "size": str(shares or 0),
-                    "price": "1.0",
-                    "nonce": int(time.time() * 1000)
-                })
-                redeem_data["signature"] = signature
-            except Exception as e:
-                if config.VERBOSE_LOGGING:
-                    print(f"⚠️ Could not sign redemption: {e}")
-            
-            response = self._make_request("POST", url, data=redeem_data, authenticated=True)
-            
-            if response:
-                # Check for success indicators
-                if response.get("success") or response.get("redeemed") or "tx" in response:
-                    amount = float(response.get("amount") or response.get("redeemed_amount") or shares or 0)
-                    return {
-                        "success": True,
-                        "amount_usdc": amount,
-                        "shares_redeemed": shares or amount,
-                        "method": "redeem_endpoint",
-                        "tx_hash": response.get("tx") or response.get("txHash") or response.get("transaction_hash"),
-                        "raw_response": response
-                    }
-            
-            return None
-            
-        except Exception as e:
-            if config.VERBOSE_LOGGING:
-                print(f"⚠️ Redeem endpoint error: {e}")
-            return None
+        if config.VERBOSE_LOGGING:
+            print("ℹ️ Note: Polymarket redemption is on-chain, not via REST API")
+        return None
     
     def _try_claim_endpoint(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
         """
-        Try to claim/redeem via the /claim endpoint.
+        DEPRECATED: The /claim endpoint does not exist in Polymarket CLOB API.
+        Redemption happens on-chain via smart contracts.
         
-        Some Polymarket implementations use a claim endpoint instead of redeem.
+        This method is kept for backwards compatibility but always returns None.
         """
-        try:
-            url = f"{self.clob_url}/claim"
-            
-            claim_data = {
-                "token_id": token_id,
-            }
-            
-            if shares is not None and shares > 0:
-                claim_data["amount"] = str(shares)
-            
-            response = self._make_request("POST", url, data=claim_data, authenticated=True)
-            
-            if response:
-                if response.get("success") or response.get("claimed"):
-                    amount = float(response.get("amount") or response.get("claimed_amount") or shares or 0)
-                    return {
-                        "success": True,
-                        "amount_usdc": amount,
-                        "shares_redeemed": shares or amount,
-                        "method": "claim_endpoint",
-                        "raw_response": response
-                    }
-            
-            return None
-            
-        except Exception as e:
-            if config.VERBOSE_LOGGING:
-                print(f"⚠️ Claim endpoint error: {e}")
-            return None
+        if config.VERBOSE_LOGGING:
+            print("ℹ️ Note: Polymarket claims are on-chain, not via REST API")
+        return None
     
     def _check_auto_redemption(self, token_id: str, expected_shares: Optional[float]) -> Optional[Dict]:
         """
@@ -1941,30 +2620,31 @@ class PolymarketClient:
     
     def redeem_all_winning_positions(self) -> Dict[str, Any]:
         """
-        Attempt to redeem all winning positions in the account.
+        Attempt to redeem all WINNING positions on-chain.
         
-        This is useful for cleanup after multiple trades or
-        if any redemptions were missed.
+        IMPORTANT: Only redeems positions where current_price >= 0.90 (winning).
+        Positions with current_price ~= 0 are LOSING positions and are skipped.
+        
+        For each winning position, this method calls the CTF contract's
+        `redeemPositions` function to burn tokens and receive USDC.
         
         Returns:
-            Dict with summary:
-            {
-                "total_redeemed": float,
-                "positions_processed": int,
-                "positions_redeemed": int,
-                "failed": List[str]  # token IDs that failed
-            }
+            Dict with summary of redemption results
         """
         if config.TEST_MODE:
             return {
                 "total_redeemed": 0,
                 "positions_processed": 0,
-                "positions_redeemed": 0,
+                "winning_positions": 0,
+                "losing_positions": 0,
+                "onchain_redeemed": 0,
+                "already_redeemed": 0,
+                "needs_manual_redemption": 0,
                 "failed": [],
                 "simulated": True
             }
         
-        print("🔍 Checking for unredeemed winning positions...")
+        print("🔍 Checking positions for redemption...")
         
         positions = self.get_open_positions()
         
@@ -1973,48 +2653,111 @@ class PolymarketClient:
             return {
                 "total_redeemed": 0,
                 "positions_processed": 0,
-                "positions_redeemed": 0,
+                "winning_positions": 0,
+                "losing_positions": 0,
+                "onchain_redeemed": 0,
+                "already_redeemed": 0,
+                "needs_manual_redemption": 0,
                 "failed": []
             }
         
-        total_redeemed = 0
-        positions_redeemed = 0
+        total_redeemed = 0.0
+        onchain_redeemed = 0
+        already_redeemed = 0
+        needs_manual = 0
         failed = []
+        winning_positions = 0
+        losing_positions = 0
+        unresolved_positions = 0
+        positions_needing_redemption = []
+        
+        print(f"📋 Found {len(positions)} open positions")
         
         for pos in positions:
             token_id = pos.get("token_id")
             shares = pos.get("size", 0)
+            cur_price = pos.get("current_price", 0)
+            title = pos.get("title", "Unknown")[:40]
             
             if not token_id or shares <= 0:
                 continue
             
-            print(f"   Attempting to redeem {shares:.4f} shares of {token_id[:16]}...")
+            # ════════════════════════════════════════════════════════════════
+            # CRITICAL: Only redeem WINNING positions (price >= 0.90)
+            # Losing positions have price ~= 0.0 and should be SKIPPED
+            # ════════════════════════════════════════════════════════════════
             
+            if cur_price < 0.10:
+                # This is a LOSING position (resolved to ~0) - no value to redeem
+                losing_positions += 1
+                if config.VERBOSE_LOGGING:
+                    print(f"   ❌ LOSS: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - skipping")
+                continue
+            elif cur_price < 0.90:
+                # Market not yet resolved or mid-priced - skip for now
+                unresolved_positions += 1
+                if config.VERBOSE_LOGGING:
+                    print(f"   ⏳ PENDING: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - not resolved")
+                continue
+            
+            # ════════════════════════════════════════════════════════════════
+            # This is a WINNING position (price >= 0.90) - attempt redemption
+            # ════════════════════════════════════════════════════════════════
+            winning_positions += 1
+            estimated_value = shares * cur_price
+            print(f"\n   💰 WIN: {title}...")
+            print(f"      {shares:.4f} shares @ ${cur_price:.2f} (~${estimated_value:.2f})")
+            
+            # Attempt redemption
             result = self.redeem_winning_shares(token_id, shares)
             
-            if result and result.get("success"):
-                amount = result.get("amount_usdc", 0)
-                total_redeemed += amount
-                positions_redeemed += 1
-                print(f"   ✅ Redeemed ${amount:.2f}")
-            else:
-                failed.append(token_id)
-                print(f"   ❌ Failed to redeem")
+            if result:
+                if result.get("method") == "onchain_redemption":
+                    # Successfully redeemed on-chain
+                    onchain_redeemed += 1
+                    amount = result.get("amount_usdc", 0)
+                    total_redeemed += amount
+                    print(f"      ✅ Redeemed ${amount:.2f} on-chain")
+                elif result.get("method") == "already_redeemed":
+                    already_redeemed += 1
+                    print(f"      ✅ Already redeemed")
+                elif result.get("needs_manual_redemption"):
+                    needs_manual += 1
+                    value = result.get("amount_usdc", 0)
+                    positions_needing_redemption.append({
+                        "token_id": token_id[:16] + "...",
+                        "shares": shares,
+                        "value": value
+                    })
+                    failed.append(token_id)
+                    print(f"      ⚠️ Needs manual redemption")
         
         summary = {
             "total_redeemed": total_redeemed,
             "positions_processed": len(positions),
-            "positions_redeemed": positions_redeemed,
+            "winning_positions": winning_positions,
+            "losing_positions": losing_positions,
+            "unresolved_positions": unresolved_positions,
+            "onchain_redeemed": onchain_redeemed,
+            "already_redeemed": already_redeemed,
+            "needs_manual_redemption": needs_manual,
             "failed": failed
         }
         
         print(f"\n📊 Redemption Summary:")
-        print(f"   Positions processed: {summary['positions_processed']}")
-        print(f"   Successfully redeemed: {summary['positions_redeemed']}")
-        print(f"   Total USDC: ${summary['total_redeemed']:.2f}")
+        print(f"   Total positions: {len(positions)}")
+        print(f"   ❌ Losing (skipped): {losing_positions}")
+        print(f"   ⏳ Unresolved: {unresolved_positions}")
+        print(f"   💰 Winning: {winning_positions}")
+        if winning_positions > 0:
+            print(f"      On-chain redeemed: {onchain_redeemed} (${total_redeemed:.2f})")
+            print(f"      Already redeemed: {already_redeemed}")
         
-        if failed:
-            print(f"   ⚠️ Failed redemptions: {len(failed)}")
+        if needs_manual > 0:
+            print(f"\n   ⚠️ Manual redemption needed: {needs_manual}")
+            print(f"   👉 Visit https://polymarket.com/portfolio to redeem:")
+            for pos in positions_needing_redemption:
+                print(f"      • {pos['shares']:.4f} shares (~${pos['value']:.2f})")
         
         return summary
 

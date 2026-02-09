@@ -114,8 +114,9 @@ MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.02"))  # 2%
 BET_SIZE_PERCENT: float = float(os.getenv("BET_SIZE_PERCENT", "0.03"))  # 3% default
 
 # Absolute minimum bet size in USD
-# Why: Polymarket has minimum order sizes, and tiny bets aren't worth fees
-MIN_BET_SIZE_USD: float = float(os.getenv("MIN_BET_SIZE_USD", "1.0"))
+# Why: Polymarket requires minimum 5 shares per order
+# At 50 cent prices, that's $2.50 minimum. We use $3.00 for safety buffer.
+MIN_BET_SIZE_USD: float = float(os.getenv("MIN_BET_SIZE_USD", "3.0"))
 
 # Absolute maximum bet size in USD (regardless of balance)
 # Why: Cap exposure on any single trade for safety
@@ -193,6 +194,22 @@ ORDER_FILL_TIMEOUT: int = int(os.getenv("ORDER_FILL_TIMEOUT", "60"))
 # Maximum slippage allowed when placing orders (as decimal)
 # Why 2%: Allow some slippage for fills, but reject if price moves too much
 MAX_ORDER_SLIPPAGE: float = float(os.getenv("MAX_ORDER_SLIPPAGE", "0.02"))  # 2%
+
+# Maximum price the bot will pay for a position (as decimal, e.g., 0.57 = 57 cents)
+# Why 0.57: Prevents buying at high prices that reduce potential profit
+# If the best available fill price exceeds this, the order is rejected
+MAX_BUY_PRICE: float = float(os.getenv("MAX_BUY_PRICE", "0.57"))
+
+# Maximum price drift allowed between signal detection and order execution (as decimal)
+# Why 0.03: If the market moves more than 3 cents against us since we detected the signal,
+# the edge we calculated is no longer valid - reject the trade
+# Example: Signal at 0.45, but by execution time ask is 0.49 → reject (0.04 drift > 0.03 max)
+MAX_PRICE_DRIFT: float = float(os.getenv("MAX_PRICE_DRIFT", "0.03"))  # 3 cents
+
+# Use real-time orderbook for signal detection (not cached market prices)
+# Why True: Cached prices can be seconds old, causing false edge detection
+# Set to False only for testing or if API rate limits are an issue
+USE_REALTIME_ORDERBOOK_FOR_SIGNALS: bool = os.getenv("USE_REALTIME_ORDERBOOK_FOR_SIGNALS", "true").lower() == "true"
 
 # Whether to cancel unfilled orders after timeout
 # Why True: Don't leave stale orders that might fill unexpectedly later

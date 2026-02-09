@@ -111,7 +111,10 @@ def calculate_edge(fair_probability: float, market_odds: float) -> float:
 
 def get_market_odds_for_side(market: Market, side: str) -> float:
     """
-    Get the current market odds for a specific side.
+    Get the current market odds for a specific side using cached market prices.
+    
+    WARNING: This uses cached prices from when the market was fetched, which may be
+    several seconds old. For execution decisions, use get_realtime_odds_for_side().
     
     Args:
         market: The market object
@@ -135,6 +138,37 @@ def get_market_odds_for_side(market: Market, side: str) -> float:
         # But the No price is 1 - Yes price
         # We want to buy No if we think price goes down
         return market.no_price
+
+
+def get_realtime_odds_for_side(
+    market: Market, 
+    side: str, 
+    polymarket_client: PolymarketClient
+) -> tuple[float, float]:
+    """
+    Get REAL-TIME market odds by fetching fresh orderbook data.
+    
+    This should be used for actual trading decisions to avoid using stale prices.
+    The cached market.yes_price/no_price can be several seconds old.
+    
+    Args:
+        market: The market object
+        side: "UP" or "DOWN"
+        polymarket_client: Client to fetch orderbook
+    
+    Returns:
+        Tuple of (best_bid, best_ask) for the side, or (0, 0) if unavailable
+    """
+    side_normalized = "up" if side == "UP" else "down"
+    
+    prices = polymarket_client.get_best_prices(market, side_normalized)
+    
+    if prices is None or prices.get("is_fallback", True):
+        # Fall back to cached prices if orderbook unavailable
+        cached_price = get_market_odds_for_side(market, side)
+        return (cached_price, cached_price)
+    
+    return (prices.get("bid", 0), prices.get("ask", 0))
 
 
 def analyze_trade_opportunity(
@@ -236,13 +270,45 @@ def analyze_trade_opportunity(
     signal.bias_strength = strength
     
     # ─────────────────────────────────────────────────────────────────────────
-    # FILTER 7: Get Market Odds
+    # FILTER 7: Get Market Odds (REAL-TIME from orderbook)
     # ─────────────────────────────────────────────────────────────────────────
-    market_odds = get_market_odds_for_side(market, bias)
+    # CRITICAL: Use real-time orderbook prices, not cached market prices!
+    # Cached prices can be several seconds old, leading to false edge detection.
+    # The market can move significantly in just a few seconds.
+    
+    if config.USE_REALTIME_ORDERBOOK_FOR_SIGNALS:
+        # Fetch fresh orderbook prices - use the ASK price since we're buying
+        best_bid, best_ask = get_realtime_odds_for_side(market, bias, polymarket_client)
+        
+        # For buying, we care about the ASK price (what we'll actually pay)
+        # Using bid would give us a false lower price
+        market_odds = best_ask if best_ask > 0 else best_bid
+        
+        if config.VERBOSE_LOGGING and best_ask > 0:
+            cached_price = get_market_odds_for_side(market, bias)
+            if abs(market_odds - cached_price) > 0.01:
+                print(f"📊 Real-time vs cached price: {market_odds:.3f} vs {cached_price:.3f} (diff: {(market_odds - cached_price)*100:.1f}¢)")
+    else:
+        # Fall back to cached prices (not recommended for live trading)
+        market_odds = get_market_odds_for_side(market, bias)
+    
     signal.market_odds = market_odds
     
     if market_odds <= 0 or market_odds >= 1:
         signal.skip_reason = f"Invalid market odds: {market_odds}"
+        return signal
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # FILTER 7.5: CRITICAL - Only bet when we can buy CHEAP (market_odds < fair_prob)
+    # ─────────────────────────────────────────────────────────────────────────
+    # We want to BUY when the market is pricing the outcome LOWER than our fair value.
+    # Example: If we think UP has 55% fair probability, we should only buy if market price < 55%
+    #          Buying at 77% means we're OVERPAYING (negative edge!)
+    if market_odds >= fair_prob:
+        signal.skip_reason = (
+            f"Market price too high: {market_odds*100:.1f}% >= fair {fair_prob*100:.1f}% "
+            f"(need to buy BELOW fair value)"
+        )
         return signal
     
     # ─────────────────────────────────────────────────────────────────────────

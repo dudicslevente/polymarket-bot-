@@ -17,6 +17,9 @@ numpy>=1.24.0
 # Plotting (Optional, for backtest visualization)
 matplotlib>=3.7.0
 
+# Web3 for on-chain redemption of winning positions (REQUIRED for live trading)
+web3>=6.0.0
+
 # Optional but recommended for better async support
 # (not used in v1, but useful for future extensions)
 # aiohttp>=3.9.0

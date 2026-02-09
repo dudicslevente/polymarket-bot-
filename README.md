@@ -499,7 +499,7 @@ POLYMARKET_PRIVATE_KEY=your_private_key
 # --- CONSERVATIVE BET SIZING ---
 # Start SMALL - you can always increase later
 BET_SIZE_PERCENT=0.03          # 3% of balance per trade
-MIN_BET_SIZE_USD=1.0           # Minimum $1 per trade
+MIN_BET_SIZE_USD=3.0           # Minimum $3 per trade (Polymarket requires 5 shares minimum!)
 MAX_BET_SIZE_USD=5.0           # Maximum $5 per trade (KEEP LOW!)
 
 # --- STRICT SAFETY LIMITS ---
@@ -738,9 +738,11 @@ All settings are in your `.env` file.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `BET_SIZE_PERCENT` | `0.03` | Bet 3% of balance per trade |
-| `MIN_BET_SIZE_USD` | `1.0` | Minimum bet size |
+| `MIN_BET_SIZE_USD` | `3.0` | Minimum bet size (**must be ≥$2.50 to meet Polymarket's 5 share minimum**) |
 | `MAX_BET_SIZE_USD` | `10.0` | Maximum bet size |
 | `MIN_BALANCE_TO_TRADE` | `10.0` | Stop trading below this balance |
+
+> ⚠️ **Important:** Polymarket requires a **minimum of 5 shares per order**. At typical prices (~$0.50), this means a minimum bet of ~$2.50. The default `MIN_BET_SIZE_USD=3.0` ensures this requirement is met.
 
 ### Strategy Parameters
 
@@ -1165,6 +1167,50 @@ for pos in positions:
 ## 🔧 Troubleshooting
 
 ### Common Issues
+
+#### "Size lower than the minimum: 5" (Order Rejected)
+
+**Cause:** Polymarket CLOB requires a **minimum of 5 shares** per order.
+
+**Explanation:**
+- Polymarket enforces a minimum order size of **5 shares**
+- At $0.50 price per share, that's a minimum of **$2.50** per order
+- Small bets (e.g., $1.41) result in only ~2.8 shares, which is rejected
+
+**Solution:**
+1. **Increase `MIN_BET_SIZE_USD`** in your `.env` or `config.py`:
+   ```bash
+   # Minimum $3.00 ensures at least 5 shares at ~$0.50 prices
+   MIN_BET_SIZE_USD=3.0
+   ```
+
+2. **Or increase your bet percentage**:
+   ```bash
+   # 5% of balance instead of 3%
+   BET_SIZE_PERCENT=0.05
+   ```
+
+3. **Ensure adequate balance**: With a $50 balance at 3% bet size = $1.50 bet, which is too small. Either:
+   - Increase balance to $100+ (3% = $3.00 ✅)
+   - Or increase bet percentage
+
+> **Note:** The bot automatically adjusts orders up to 5 shares when possible, but the initial bet size must be close enough to afford this adjustment.
+
+#### "Order book spread too wide" / "Slippage too high: 98%"
+
+**Cause:** The market's order book has no liquidity at competitive prices.
+
+**Explanation:**
+- Polymarket order books can show extreme spreads (bid: $0.01, ask: $0.99)
+- This happens when:
+  - The market is near resolution (outcome is nearly certain)
+  - No market makers are providing liquidity at fair prices
+- The bot correctly rejects these illiquid conditions
+
+**Solution:**
+- Wait for fresh markets (the bot does this automatically)
+- The bot uses `MAX_MARKET_AGE_SECONDS=180` to only trade young markets
+- If you see this consistently, the markets may have structural liquidity issues
 
 #### "No BTC 15-min markets found"
 

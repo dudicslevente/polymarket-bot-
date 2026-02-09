@@ -216,6 +216,12 @@ def run_trading_loop(
                 if trade:
                     trade_executed = True
                     
+                    # Trade will be logged after resolution (not while PENDING)
+                    # to avoid duplicate rows. Active trades are tracked in memory
+                    # and will be logged when they resolve.
+                    if not config.TEST_MODE:
+                        print(f"   ⏳ Trade placed, awaiting resolution...")
+                    
                     # In simulation mode, we can optionally fast-forward
                     # to resolution for testing purposes
                     # Uncomment below to auto-resolve immediately:

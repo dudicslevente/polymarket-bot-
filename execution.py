@@ -75,12 +75,15 @@ class ExecutionState:
     
     Maintains virtual balance, active trades, and cooldown timers.
     
-    Note: `logging_balance` is a separate balance tracker used for CSV logging.
-    It ensures that balance_before/balance_after form a consistent sequential chain,
-    even when multiple trades are active simultaneously.
+    Balance tracking:
+    - `balance`: The actual available balance for trading (deducted when bet placed)
+    - `resolved_balance`: Balance after all resolved trades (used for CSV logging)
+    
+    This ensures balance_before/balance_after in CSV form a consistent sequential
+    chain based on resolution order, not entry order.
     """
     balance: float = config.INITIAL_VIRTUAL_BALANCE
-    logging_balance: float = config.INITIAL_VIRTUAL_BALANCE  # For CSV consistency
+    resolved_balance: float = config.INITIAL_VIRTUAL_BALANCE  # Balance after resolved trades (for CSV)
     session_starting_balance: float = config.INITIAL_VIRTUAL_BALANCE  # Balance when bot started
     trades: List[Trade] = field(default_factory=list)
     active_trades: Dict[str, Trade] = field(default_factory=dict)
@@ -126,7 +129,7 @@ class ExecutionEngine:
         # Load starting balance
         if config.TEST_MODE:
             self.state.balance = config.INITIAL_VIRTUAL_BALANCE
-            self.state.logging_balance = config.INITIAL_VIRTUAL_BALANCE
+            self.state.resolved_balance = config.INITIAL_VIRTUAL_BALANCE
             self.state.session_starting_balance = config.INITIAL_VIRTUAL_BALANCE
             self.state.daily_starting_balance = config.INITIAL_VIRTUAL_BALANCE
             print(f"💰 Starting virtual balance: ${self.state.balance:.2f}")
@@ -163,7 +166,7 @@ class ExecutionEngine:
             )
         
         self.state.balance = real_balance
-        self.state.logging_balance = real_balance
+        self.state.resolved_balance = real_balance
         self.state.session_starting_balance = real_balance
         self.state.daily_starting_balance = real_balance
         
@@ -191,10 +194,10 @@ class ExecutionEngine:
         old_balance = self.state.balance
         self.state.balance = new_balance
         
-        # Only update logging_balance if no active trades
+        # Only update resolved_balance if no active trades
         # (active trades will update it upon resolution)
         if not self.state.active_trades:
-            self.state.logging_balance = new_balance
+            self.state.resolved_balance = new_balance
         
         if config.VERBOSE_LOGGING:
             diff = new_balance - old_balance
@@ -458,21 +461,17 @@ class ExecutionEngine:
         # Create trade ID
         trade_id = f"T{int(time.time()*1000)}"
         
-        # Record balance before trade (use logging_balance for CSV consistency)
-        # logging_balance represents the balance after all RESOLVED trades
-        # It is NOT modified at entry, only at resolution
-        balance_before_logging = self.state.logging_balance
-        
         # Store actual balance before deduction for restoration on failure
         actual_balance_before = self.state.balance
         
-        # Deduct bet from actual trading balance only (not logging_balance)
-        # logging_balance is only updated when trades RESOLVE, not when they're placed
-        # This ensures correct balance_before even when trades overlap
+        # Deduct bet from actual trading balance
+        # Note: resolved_balance is NOT modified here - only at resolution time
+        # This ensures balance_before/balance_after form a correct chain in CSV
         self.state.balance -= bet_size
         
         # Create trade record
-        # balance_after will be calculated at resolution time
+        # balance_before and balance_after will be set at resolution time
+        # This ensures correct sequential tracking even when trades overlap
         trade = Trade(
             trade_id=trade_id,
             market_id=signal.market.market_id,
@@ -483,8 +482,8 @@ class ExecutionEngine:
             edge=signal.edge,
             btc_price_at_entry=signal.btc_price,
             bet_size=bet_size,
-            balance_before=balance_before_logging,
-            balance_after=0.0,  # Will be set at resolution time
+            balance_before=0.0,  # Will be set at resolution time
+            balance_after=0.0,   # Will be set at resolution time
             status=TradeStatus.PENDING,
             entry_time=datetime.now(timezone.utc),
             mode="TEST" if config.TEST_MODE else "LIVE"
@@ -513,12 +512,11 @@ class ExecutionEngine:
                 self.state.balance = actual_balance_before - trade.bet_size
             
             print(f"✅ Trade executed: {trade.side} ${trade.bet_size:.2f} @ {trade.entry_odds:.3f}")
-            print(f"   Balance: ${balance_before_logging:.2f} → ${self.state.balance:.2f}")
+            print(f"   Available balance: ${self.state.balance:.2f}")
             
             return trade
         else:
-            # Refund on failure - restore actual balance (not logging_balance)
-            # logging_balance was never modified, so no need to restore it
+            # Refund on failure - restore actual balance
             self.state.balance = actual_balance_before
             trade.status = TradeStatus.FAILED
             print(f"❌ Trade execution failed - balance restored to ${actual_balance_before:.2f}")
@@ -848,17 +846,22 @@ class ExecutionEngine:
             # Update actual balance (for bot's internal tracking)
             self.state.balance += payout
             
-            # Update logging_balance: deduct bet and add payout
-            # This maintains the sequential chain for CSV logging
-            self.state.logging_balance = self.state.logging_balance - trade.bet_size + payout
+            # ════════════════════════════════════════════════════════════════
+            # CSV Balance Tracking (sequential chain based on resolution order)
+            # ════════════════════════════════════════════════════════════════
+            # Set balance_before to the resolved_balance BEFORE this trade resolves
+            trade.balance_before = self.state.resolved_balance
             
-            # Set balance_after based on the new logging_balance
-            trade.balance_after = self.state.logging_balance
+            # Calculate profit and update resolved_balance
+            profit = payout - trade.bet_size
+            self.state.resolved_balance += profit
+            
+            # Set balance_after to the new resolved_balance
+            trade.balance_after = self.state.resolved_balance
             
             self.state.wins += 1
             
             # Update daily stats
-            profit = payout - trade.bet_size
             self.state.daily_wins += 1
             self.state.daily_pnl += profit
             
@@ -866,7 +869,7 @@ class ExecutionEngine:
             self.state.consecutive_wins += 1
             self.state.consecutive_losses = 0
             
-            print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.balance:.2f}")
+            print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.resolved_balance:.2f}")
             
             # Sync balance from Polymarket after redemption
             if not config.TEST_MODE:
@@ -878,11 +881,17 @@ class ExecutionEngine:
             trade.payout = 0.0
             trade.redemption_status = "N/A"  # No redemption needed for losses
             
-            # Update logging_balance: deduct bet (no payout)
-            self.state.logging_balance = self.state.logging_balance - trade.bet_size
+            # ════════════════════════════════════════════════════════════════
+            # CSV Balance Tracking (sequential chain based on resolution order)
+            # ════════════════════════════════════════════════════════════════
+            # Set balance_before to the resolved_balance BEFORE this trade resolves
+            trade.balance_before = self.state.resolved_balance
             
-            # Set balance_after based on the new logging_balance
-            trade.balance_after = self.state.logging_balance
+            # Update resolved_balance (deduct bet, no payout)
+            self.state.resolved_balance -= trade.bet_size
+            
+            # Set balance_after to the new resolved_balance
+            trade.balance_after = self.state.resolved_balance
             
             self.state.losses += 1
             
@@ -894,7 +903,7 @@ class ExecutionEngine:
             self.state.consecutive_losses += 1
             self.state.consecutive_wins = 0
             
-            print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
+            print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.resolved_balance:.2f}")
             
             # Check if we should pause (will be evaluated on next can_trade call)
             if config.MAX_CONSECUTIVE_LOSSES > 0:
@@ -1055,19 +1064,22 @@ class ExecutionEngine:
                     print(f"   Token ID: {trade.token_id}")
                     print(f"   Shares: {trade.filled_shares}")
             
-            # Update balances
+            # Update actual balance
             self.state.balance += payout
-            self.state.logging_balance = self.state.logging_balance - trade.bet_size + payout
-            trade.balance_after = self.state.logging_balance
+            
+            # CSV Balance Tracking (sequential chain based on resolution order)
+            trade.balance_before = self.state.resolved_balance
+            profit = payout - trade.bet_size
+            self.state.resolved_balance += profit
+            trade.balance_after = self.state.resolved_balance
             
             self.state.wins += 1
-            profit = payout - trade.bet_size
             self.state.daily_wins += 1
             self.state.daily_pnl += profit
             self.state.consecutive_wins += 1
             self.state.consecutive_losses = 0
             
-            print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.balance:.2f}")
+            print(f"🎉 WIN: {trade.side} | Profit: ${profit:.2f} | Balance: ${self.state.resolved_balance:.2f}")
             
             # Sync balance from Polymarket after redemption
             if not config.TEST_MODE:
@@ -1079,8 +1091,10 @@ class ExecutionEngine:
             trade.payout = 0.0
             trade.redemption_status = "N/A"  # No redemption needed for losses
             
-            self.state.logging_balance = self.state.logging_balance - trade.bet_size
-            trade.balance_after = self.state.logging_balance
+            # CSV Balance Tracking (sequential chain based on resolution order)
+            trade.balance_before = self.state.resolved_balance
+            self.state.resolved_balance -= trade.bet_size
+            trade.balance_after = self.state.resolved_balance
             
             self.state.losses += 1
             self.state.daily_losses += 1
@@ -1088,7 +1102,7 @@ class ExecutionEngine:
             self.state.consecutive_losses += 1
             self.state.consecutive_wins = 0
             
-            print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
+            print(f"😞 LOSS: {trade.side} | Lost: ${trade.bet_size:.2f} | Balance: ${self.state.resolved_balance:.2f}")
             
             if config.MAX_CONSECUTIVE_LOSSES > 0:
                 if self.state.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
@@ -1101,14 +1115,16 @@ class ExecutionEngine:
             trade.payout = 0.0
             trade.redemption_status = "UNKNOWN"
             
-            self.state.logging_balance = self.state.logging_balance - trade.bet_size
-            trade.balance_after = self.state.logging_balance
+            # CSV Balance Tracking (sequential chain based on resolution order)
+            trade.balance_before = self.state.resolved_balance
+            self.state.resolved_balance -= trade.bet_size
+            trade.balance_after = self.state.resolved_balance
             
             self.state.losses += 1
             self.state.daily_losses += 1
             self.state.daily_pnl -= trade.bet_size
             
-            print(f"❓ UNKNOWN: {trade.side} | Assuming loss: ${trade.bet_size:.2f} | Balance: ${self.state.balance:.2f}")
+            print(f"❓ UNKNOWN: {trade.side} | Assuming loss: ${trade.bet_size:.2f} | Balance: ${self.state.resolved_balance:.2f}")
         
         # Update daily trade counter
         self.state.daily_trades += 1

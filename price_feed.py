@@ -137,32 +137,31 @@ class BinanceClient:
         """
         data = self._make_request("/api/v3/ticker/price", {"symbol": "BTCUSDT"})
         
-        if not data:
-            # Fallback to cached price if recent enough (within 60 seconds)
-            if self._cached_price:
-                cached_price, cached_time = self._cached_price
-                if time.time() - cached_time < 60:
-                    if config.VERBOSE_LOGGING:
-                        print(f"📦 Using cached BTC price: ${cached_price:,.2f}")
-                    return cached_price
-            return None
-        
-        try:
-            price = float(data.get("price", 0))
-            if price > 0:
-                # Update cache with timestamp
-                self._cached_price = (price, time.time())
-                # Cache the price for history
-                self._last_prices.append(PriceData(
-                    price=price,
-                    timestamp=datetime.now(timezone.utc)
-                ))
-                # Keep only last 10 minutes of prices
-                self._cleanup_price_cache()
-                return price
-        except (ValueError, TypeError):
-            pass
-        
+        if data:
+            try:
+                price = float(data.get("price", 0))
+                if price > 0:
+                    # Update cache with timestamp
+                    self._cached_price = (price, time.time())
+                    # Cache the price for history
+                    self._last_prices.append(PriceData(
+                        price=price,
+                        timestamp=datetime.now(timezone.utc)
+                    ))
+                    # Keep only last 10 minutes of prices
+                    self._cleanup_price_cache()
+                    return price
+            except (ValueError, TypeError):
+                pass
+                
+        # Fallback to cached price if recent enough (within 60 seconds)
+        if self._cached_price:
+            cached_price, cached_time = self._cached_price
+            if time.time() - cached_time < 60:
+                if config.VERBOSE_LOGGING:
+                    print(f"📦 Using cached BTC price: ${cached_price:,.2f}")
+                return cached_price
+                
         return None
     
     def _cleanup_price_cache(self):

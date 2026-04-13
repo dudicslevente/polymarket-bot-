@@ -754,6 +754,24 @@ All settings are in your `.env` file.
 | `MILD_BIAS_FAIR_PROB` | `0.52` | Fair probability for mild bias |
 | `STRONG_BIAS_FAIR_PROB` | `0.55` | Fair probability for strong bias |
 
+### Price Source for Edge Calculation
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `EDGE_PRICE_SOURCE` | `CLOB` | Which price source to use for edge calculation |
+
+**Options for `EDGE_PRICE_SOURCE`:**
+
+| Value | Source | Description |
+|-------|--------|-------------|
+| `CLOB` | Order Book | Real-time bid/ask prices from the CLOB API. Most accurate but requires more API calls. **Recommended for live trading.** |
+| `GAMMA` | Gamma API | Cached market prices (`outcomePrices`). Faster with fewer API calls, but prices may be stale by several seconds. Good for testing or when hitting rate limits. |
+
+**When to use each:**
+- **Live Trading**: Use `CLOB` for accurate edge detection. Stale prices can lead to false signals.
+- **Testing/Backtesting**: Use `GAMMA` to reduce API load and avoid rate limits.
+- **Rate Limit Issues**: Switch to `GAMMA` if you're hitting API limits frequently.
+
 ### Safety Limits
 
 | Setting | Default | Description |

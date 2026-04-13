@@ -6,6 +6,9 @@
 # Trade logs (optional - you may want to keep these)
 # trades.csv
 
+# Active trades state (runtime file, not for version control)
+active_trades.json
+
 # Python
 __pycache__/
 *.py[cod]

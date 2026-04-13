@@ -134,12 +134,15 @@ class PolymarketClient:
                 headers = {"Content-Type": "application/json"}
             
             try:
-                # Reduced timeout from 10s to 5s for faster failure detection
-                timeout = 5
-                if method.upper() == "GET":
+                # Reduced timeout from 5s to 10s for some slower endpoints
+                timeout = 10
+                method_upper = method.upper()
+                if method_upper == "GET":
                     response = requests.get(url, params=params, headers=headers, timeout=timeout)
-                elif method.upper() == "POST":
+                elif method_upper == "POST":
                     response = requests.post(url, json=data, headers=headers, timeout=timeout)
+                elif method_upper == "DELETE":
+                    response = requests.delete(url, headers=headers, timeout=timeout)
                 else:
                     print(f"❌ Unsupported HTTP method: {method}")
                     return None
@@ -1105,8 +1108,23 @@ class PolymarketClient:
             # Create and sign the order
             signed_order = clob_client.create_order(order_args)
             
-            # Post the order to the CLOB
-            result = clob_client.post_order(signed_order, orderType=OrderType.GTC)
+            # Post the order to the CLOB with retry logic for network timeouts
+            result = None
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    result = clob_client.post_order(signed_order, orderType=OrderType.GTC)
+                    break  # Success, exit retry loop
+                except Exception as retry_error:
+                    error_str = str(retry_error).lower()
+                    is_timeout = "timeout" in error_str or "readtimeout" in error_str or "request exception" in error_str
+                    
+                    if is_timeout and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
+                        print(f"⚠️ Order submission timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        raise  # Re-raise if not a timeout or last attempt
             
             if config.VERBOSE_LOGGING:
                 print(f"📥 Order response: {result}")
@@ -1293,7 +1311,7 @@ class PolymarketClient:
 
     def cancel_order(self, order_id: str) -> bool:
         """
-        Cancel an open order.
+        Cancel an open order using the CLOB API.
         
         Args:
             order_id: The order ID to cancel
@@ -1311,22 +1329,23 @@ class PolymarketClient:
         url = f"{self.clob_url}/order/{order_id}"
         
         try:
-            # DELETE request for cancellation
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            path = parsed.path
+            # Use _make_request with authenticated=True (it uses L2 headers correctly)
+            result = self._make_request("DELETE", url, authenticated=True)
             
-            headers = self._auth.get_l1_headers("DELETE", path)
+            if result and (result.get("success") or result.get("status") == "CANCELLED"):
+                print(f"✅ Order {order_id} cancelled")
+                return True
             
-            response = requests.delete(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            # If result is None but we're here, it might have failed
+            # or already been cancelled/filled. Check status.
+            status_data = self.get_order_status(order_id)
+            if status_data:
+                status = self._parse_order_status(status_data)
+                if status in ["CANCELLED", "FILLED", "MATCHED"]:
+                    return True
             
-            print(f"✅ Order {order_id} cancelled")
-            return True
-            
-        except requests.exceptions.HTTPError as e:
-            print(f"❌ Failed to cancel order: {e}")
             return False
+            
         except Exception as e:
             print(f"❌ Error cancelling order: {e}")
             return False
@@ -2244,10 +2263,12 @@ class PolymarketClient:
             Standardized position dict
         """
         return {
-            "token_id": data.get("token_id") or data.get("tokenId") or data.get("asset_id"),
+            "token_id": data.get("token_id") or data.get("tokenId") or data.get("asset_id") or data.get("asset"),
             "size": float(data.get("size") or data.get("shares") or data.get("balance") or 0),
             "avg_price": float(data.get("avg_price") or data.get("avgPrice") or data.get("average_price") or 0),
-            "market_id": data.get("market_id") or data.get("marketId") or data.get("condition_id"),
+            "current_price": float(data.get("current_price") or data.get("curPrice") or 0),
+            "market_id": data.get("market_id") or data.get("marketId") or data.get("condition_id") or data.get("conditionId"),
+            "condition_id": data.get("condition_id") or data.get("conditionId") or data.get("market_id"),
             "side": data.get("side") or data.get("outcome"),
             "unrealized_pnl": float(data.get("unrealized_pnl") or data.get("unrealizedPnl") or 0),
             "raw": data  # Keep raw data for debugging
@@ -2440,15 +2461,15 @@ class PolymarketClient:
             ]
             
             # Get wallet credentials
-            private_key = os.getenv("WALLET_PRIVATE_KEY")
-            wallet_address = os.getenv("WALLET_ADDRESS")
+            private_key = config.WALLET_PRIVATE_KEY
+            wallet_address = config.WALLET_ADDRESS
             
             if not private_key or not wallet_address:
                 print("❌ Cannot redeem: WALLET_PRIVATE_KEY and WALLET_ADDRESS required")
                 return None
             
             # Connect to Polygon
-            rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+            rpc_url = getattr(config, 'POLYGON_RPC_URL', "https://polygon-bor-rpc.publicnode.com")
             web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
             web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             

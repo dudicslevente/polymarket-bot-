@@ -15,14 +15,19 @@ The execution logic is deliberately simple:
 
 import random
 import time
+import json
+import os
 from typing import Optional, Dict, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 
 import config
 from market import Market, PolymarketClient
 from strategy import TradeSignal
+
+# File to persist active trades (survives bot restarts)
+ACTIVE_TRADES_FILE = "active_trades.json"
 
 
 class TradeStatus(Enum):
@@ -136,6 +141,96 @@ class ExecutionEngine:
         else:
             # In LIVE mode, fetch real balance from Polymarket
             self._initialize_live_balance()
+            # Load any pending trades from previous session
+            self._load_active_trades()
+    
+    def _load_active_trades(self):
+        """
+        Load active trades from disk on startup.
+        
+        This ensures trades aren't lost if the bot restarts before resolution.
+        """
+        if not os.path.exists(ACTIVE_TRADES_FILE):
+            return
+        
+        try:
+            with open(ACTIVE_TRADES_FILE, 'r') as f:
+                trades_data = json.load(f)
+            
+            if not trades_data:
+                return
+            
+            loaded_count = 0
+            for trade_dict in trades_data:
+                try:
+                    # Reconstruct Trade object from dict
+                    trade = Trade(
+                        trade_id=trade_dict["trade_id"],
+                        market_id=trade_dict["market_id"],
+                        market_question=trade_dict["market_question"],
+                        side=trade_dict["side"],
+                        entry_odds=trade_dict["entry_odds"],
+                        fair_probability=trade_dict["fair_probability"],
+                        edge=trade_dict["edge"],
+                        btc_price_at_entry=trade_dict["btc_price_at_entry"],
+                        bet_size=trade_dict["bet_size"],
+                        balance_before=trade_dict["balance_before"],
+                        balance_after=trade_dict["balance_after"],
+                        status=TradeStatus(trade_dict["status"]),
+                        entry_time=datetime.fromisoformat(trade_dict["entry_time"]),
+                        mode=trade_dict.get("mode", "LIVE"),
+                        token_id=trade_dict.get("token_id"),
+                        condition_id=trade_dict.get("condition_id"),
+                        order_id=trade_dict.get("order_id"),
+                        filled_price=trade_dict.get("filled_price"),
+                        filled_shares=trade_dict.get("filled_shares"),
+                    )
+                    self.state.active_trades[trade.trade_id] = trade
+                    loaded_count += 1
+                except Exception as e:
+                    print(f"⚠️ Could not load trade {trade_dict.get('trade_id', '?')}: {e}")
+            
+            if loaded_count > 0:
+                print(f"📂 Loaded {loaded_count} pending trade(s) from previous session")
+                
+        except Exception as e:
+            print(f"⚠️ Could not load active trades file: {e}")
+    
+    def _save_active_trades(self):
+        """
+        Save active trades to disk for persistence across restarts.
+        """
+        try:
+            trades_data = []
+            for trade in self.state.active_trades.values():
+                trade_dict = {
+                    "trade_id": trade.trade_id,
+                    "market_id": trade.market_id,
+                    "market_question": trade.market_question,
+                    "side": trade.side,
+                    "entry_odds": trade.entry_odds,
+                    "fair_probability": trade.fair_probability,
+                    "edge": trade.edge,
+                    "btc_price_at_entry": trade.btc_price_at_entry,
+                    "bet_size": trade.bet_size,
+                    "balance_before": trade.balance_before,
+                    "balance_after": trade.balance_after,
+                    "status": trade.status.value,
+                    "entry_time": trade.entry_time.isoformat(),
+                    "mode": trade.mode,
+                    "token_id": trade.token_id,
+                    "condition_id": trade.condition_id,
+                    "order_id": trade.order_id,
+                    "filled_price": trade.filled_price,
+                    "filled_shares": trade.filled_shares,
+                }
+                trades_data.append(trade_dict)
+            
+            with open(ACTIVE_TRADES_FILE, 'w') as f:
+                json.dump(trades_data, f, indent=2)
+                
+        except Exception as e:
+            print(f"❌ Failed to save active trades: {e}")
     
     def _initialize_live_balance(self):
         """
@@ -511,6 +606,10 @@ class ExecutionEngine:
                 # Restore the original deduction and apply the correct one
                 self.state.balance = actual_balance_before - trade.bet_size
             
+            # Persist active trades to disk (survives bot restart)
+            if not config.TEST_MODE:
+                self._save_active_trades()
+            
             print(f"✅ Trade executed: {trade.side} ${trade.bet_size:.2f} @ {trade.entry_odds:.3f}")
             print(f"   Available balance: ${self.state.balance:.2f}")
             
@@ -792,6 +891,10 @@ class ExecutionEngine:
             if trade.trade_id in self.state.active_trades:
                 del self.state.active_trades[trade.trade_id]
         
+        # Persist updated active trades to disk
+        if resolved_trades and not config.TEST_MODE:
+            self._save_active_trades()
+        
         return resolved_trades
     
     def _resolve_trade(self, trade: Trade):
@@ -834,9 +937,12 @@ class ExecutionEngine:
                 redemption_result = self._redeem_winning_shares(trade)
                 
                 if redemption_result:
-                    trade.redemption_status = "REDEEMED"
-                    trade.redemption_amount = redemption_result.get("amount_usdc", payout)
-                    print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                    if not redemption_result.get("needs_manual_redemption"):
+                        trade.redemption_status = "REDEEMED"
+                        trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                        print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                    else:
+                        print(f"⚠️ Shares require manual redemption on Polymarket: {trade.filled_shares} shares")
                 else:
                     trade.redemption_status = "FAILED"
                     print(f"⚠️ Redemption may have failed - check Polymarket manually")
@@ -1055,9 +1161,12 @@ class ExecutionEngine:
                 redemption_result = self._redeem_winning_shares(trade)
                 
                 if redemption_result:
-                    trade.redemption_status = "REDEEMED"
-                    trade.redemption_amount = redemption_result.get("amount_usdc", payout)
-                    print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                    if not redemption_result.get("needs_manual_redemption"):
+                        trade.redemption_status = "REDEEMED"
+                        trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                        print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                    else:
+                        print(f"⚠️ Shares require manual redemption on Polymarket: {trade.filled_shares} shares")
                 else:
                     trade.redemption_status = "FAILED"
                     print(f"⚠️ Redemption may have failed - check Polymarket manually")
@@ -1212,9 +1321,14 @@ class ExecutionEngine:
         if trade.trade_id in self.state.active_trades:
             del self.state.active_trades[trade.trade_id]
     
-    def get_stats(self) -> Dict:
+    def get_stats(self, refresh_wallet: bool = True) -> Dict:
         """
         Get current execution statistics.
+        
+        In LIVE mode, fetches the actual wallet balance from Polymarket.
+        
+        Args:
+            refresh_wallet: If True and in LIVE mode, fetch real wallet balance
         
         Returns a dictionary with key metrics.
         """
@@ -1222,18 +1336,27 @@ class ExecutionEngine:
         if self.state.total_trades > 0:
             win_rate = (self.state.wins / self.state.total_trades) * 100
         
+        # In LIVE mode, get actual wallet balance
+        current_balance = self.state.balance
+        if not config.TEST_MODE and refresh_wallet:
+            real_balance = self.polymarket.get_usdc_balance()
+            if real_balance is not None:
+                current_balance = real_balance
+                # Also update internal state to keep in sync
+                self.state.balance = real_balance
+        
         starting = self.state.session_starting_balance
-        pnl_percent = ((self.state.balance / starting) - 1) * 100 if starting > 0 else 0
+        pnl_percent = ((current_balance / starting) - 1) * 100 if starting > 0 else 0
         
         return {
-            "balance": self.state.balance,
+            "balance": current_balance,
             "starting_balance": starting,
             "total_trades": self.state.total_trades,
             "wins": self.state.wins,
             "losses": self.state.losses,
             "win_rate": win_rate,
             "active_trades": len(self.state.active_trades),
-            "pnl": self.state.balance - starting,
+            "pnl": current_balance - starting,
             "pnl_percent": pnl_percent
         }
     
@@ -1261,14 +1384,15 @@ class ExecutionEngine:
     
     def print_stats(self):
         """Print current stats to console."""
-        stats = self.get_stats()
+        stats = self.get_stats(refresh_wallet=True)
         
         pnl_symbol = "+" if stats["pnl"] >= 0 else ""
+        balance_source = "(wallet)" if not config.TEST_MODE else "(virtual)"
         
         print("\n" + "─"*50)
         print("📊 EXECUTION STATS")
         print("─"*50)
-        print(f"Balance:      ${stats['balance']:.2f}")
+        print(f"Balance:      ${stats['balance']:.2f} {balance_source}")
         print(f"P&L:          {pnl_symbol}${stats['pnl']:.2f} ({pnl_symbol}{stats['pnl_percent']:.1f}%)")
         print(f"Trades:       {stats['total_trades']} ({stats['wins']}W / {stats['losses']}L)")
         print(f"Win Rate:     {stats['win_rate']:.1f}%")

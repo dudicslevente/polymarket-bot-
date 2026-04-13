@@ -171,6 +171,64 @@ def get_realtime_odds_for_side(
     return (prices.get("bid", 0), prices.get("ask", 0))
 
 
+def get_price_for_edge_calculation(
+    market: Market,
+    side: str,
+    polymarket_client: PolymarketClient
+) -> tuple[float, str]:
+    """
+    Get the market price to use for edge calculation based on configured price source.
+    
+    This function allows switching between two price data sources:
+    - CLOB: Real-time orderbook prices (more accurate, more API calls)
+    - GAMMA: Cached market prices from Gamma API (faster, may be stale)
+    
+    The price source is configured via EDGE_PRICE_SOURCE in .env
+    
+    Args:
+        market: The market object
+        side: "UP" or "DOWN"
+        polymarket_client: Client to fetch orderbook (used only for CLOB source)
+    
+    Returns:
+        Tuple of (price, source_used) where:
+        - price: The market odds for the specified side (0.0 - 1.0)
+        - source_used: String indicating which source was used ("CLOB" or "GAMMA")
+    """
+    price_source = getattr(config, 'EDGE_PRICE_SOURCE', 'CLOB').upper()
+    
+    if price_source == "CLOB":
+        # Use real-time orderbook prices
+        best_bid, best_ask = get_realtime_odds_for_side(market, side, polymarket_client)
+        
+        # For buying, we care about the ASK price (what we'll actually pay)
+        # Using bid would give us a false lower price
+        market_odds = best_ask if best_ask > 0 else best_bid
+        
+        if config.VERBOSE_LOGGING and best_ask > 0:
+            cached_price = get_market_odds_for_side(market, side)
+            if abs(market_odds - cached_price) > 0.01:
+                print(f"📊 CLOB vs Gamma price: {market_odds:.3f} vs {cached_price:.3f} (diff: {(market_odds - cached_price)*100:.1f}¢)")
+        
+        return (market_odds, "CLOB")
+    
+    elif price_source == "GAMMA":
+        # Use cached prices from Gamma API
+        market_odds = get_market_odds_for_side(market, side)
+        
+        if config.VERBOSE_LOGGING:
+            print(f"📊 Using Gamma API price: {market_odds:.3f}")
+        
+        return (market_odds, "GAMMA")
+    
+    else:
+        # Invalid source - fall back to CLOB with warning
+        print(f"⚠️ Invalid EDGE_PRICE_SOURCE '{price_source}', defaulting to CLOB")
+        best_bid, best_ask = get_realtime_odds_for_side(market, side, polymarket_client)
+        market_odds = best_ask if best_ask > 0 else best_bid
+        return (market_odds, "CLOB")
+
+
 def analyze_trade_opportunity(
     market: Market,
     polymarket_client: PolymarketClient,
@@ -270,27 +328,13 @@ def analyze_trade_opportunity(
     signal.bias_strength = strength
     
     # ─────────────────────────────────────────────────────────────────────────
-    # FILTER 7: Get Market Odds (REAL-TIME from orderbook)
+    # FILTER 7: Get Market Odds for Edge Calculation
     # ─────────────────────────────────────────────────────────────────────────
-    # CRITICAL: Use real-time orderbook prices, not cached market prices!
-    # Cached prices can be several seconds old, leading to false edge detection.
-    # The market can move significantly in just a few seconds.
+    # The price source is configurable via EDGE_PRICE_SOURCE in .env:
+    # - "CLOB": Real-time orderbook prices (recommended for live trading)
+    # - "GAMMA": Cached market prices (faster, but may be stale)
     
-    if config.USE_REALTIME_ORDERBOOK_FOR_SIGNALS:
-        # Fetch fresh orderbook prices - use the ASK price since we're buying
-        best_bid, best_ask = get_realtime_odds_for_side(market, bias, polymarket_client)
-        
-        # For buying, we care about the ASK price (what we'll actually pay)
-        # Using bid would give us a false lower price
-        market_odds = best_ask if best_ask > 0 else best_bid
-        
-        if config.VERBOSE_LOGGING and best_ask > 0:
-            cached_price = get_market_odds_for_side(market, bias)
-            if abs(market_odds - cached_price) > 0.01:
-                print(f"📊 Real-time vs cached price: {market_odds:.3f} vs {cached_price:.3f} (diff: {(market_odds - cached_price)*100:.1f}¢)")
-    else:
-        # Fall back to cached prices (not recommended for live trading)
-        market_odds = get_market_odds_for_side(market, bias)
+    market_odds, price_source = get_price_for_edge_calculation(market, bias, polymarket_client)
     
     signal.market_odds = market_odds
     

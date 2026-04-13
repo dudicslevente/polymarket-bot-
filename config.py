@@ -211,6 +211,21 @@ MAX_PRICE_DRIFT: float = float(os.getenv("MAX_PRICE_DRIFT", "0.03"))  # 3 cents
 # Set to False only for testing or if API rate limits are an issue
 USE_REALTIME_ORDERBOOK_FOR_SIGNALS: bool = os.getenv("USE_REALTIME_ORDERBOOK_FOR_SIGNALS", "true").lower() == "true"
 
+# ────────────────────────────────────────────────────────────────────────────────
+# PRICE SOURCE FOR EDGE CALCULATION
+# ────────────────────────────────────────────────────────────────────────────────
+# Determines which price data source to use for calculating trading edge.
+# Options:
+#   "CLOB"  - Use real-time orderbook bid/ask prices from the CLOB API
+#             More accurate but requires more API calls
+#             Best for live trading where precision matters
+#   "GAMMA" - Use cached market prices from the Gamma API (outcomePrices)
+#             Faster but prices may be several seconds stale
+#             Good for testing or when API rate limits are a concern
+#
+# Note: This setting overrides USE_REALTIME_ORDERBOOK_FOR_SIGNALS for edge calculation
+EDGE_PRICE_SOURCE: str = os.getenv("EDGE_PRICE_SOURCE", "CLOB").upper()
+
 # Whether to cancel unfilled orders after timeout
 # Why True: Don't leave stale orders that might fill unexpectedly later
 CANCEL_UNFILLED_ORDERS: bool = os.getenv("CANCEL_UNFILLED_ORDERS", "true").lower() == "true"

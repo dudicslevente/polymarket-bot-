@@ -24,7 +24,7 @@ import hmac
 import json
 
 import config
-from auth import get_auth, AuthLevel, AuthError
+from auth import get_auth, reset_auth, AuthLevel, AuthError
 
 
 @dataclass
@@ -67,6 +67,9 @@ class PolymarketClient:
         
         # Auth module for authenticated requests
         self._auth = get_auth()
+        self._detected_signature_type: Optional[int] = None
+        self._last_signature_type_probe: float = 0.0
+        self._last_collateral_hint: float = 0.0
     
     def _rate_limit_check(self):
         """
@@ -111,6 +114,7 @@ class PolymarketClient:
         Returns None on error (never crashes).
         """
         last_error = None
+        auth_refreshed = False
         
         for attempt in range(retries + 1):
             self._rate_limit_check()
@@ -165,6 +169,14 @@ class PolymarketClient:
                 if response.status_code == 404:
                     print(f"⚠️ HTTP error 404: {e}")
                     return {"_error": "not_found", "_status_code": 404}
+                if response.status_code == 401 and authenticated and not auth_refreshed:
+                    if config.VERBOSE_LOGGING:
+                        print("⚠️ API auth rejected; refreshing Polymarket credentials and retrying...")
+                    reset_auth()
+                    self._auth = get_auth()
+                    auth_refreshed = True
+                    time.sleep(1)
+                    continue
                 if config.VERBOSE_LOGGING:
                     print(f"⚠️ HTTP error {response.status_code}: {e}")
                 return None
@@ -1070,23 +1082,11 @@ class PolymarketClient:
         # USE OFFICIAL py-clob-client FOR ORDER CREATION AND SUBMISSION
         # ─────────────────────────────────────────────────────────────────────
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-            from py_clob_client.constants import POLYGON
-            
-            # Initialize the official CLOB client
-            creds = ApiCreds(
-                api_key=config.POLYMARKET_API_KEY,
-                api_secret=config.POLYMARKET_API_SECRET,
-                api_passphrase=config.POLYMARKET_PASSPHRASE,
-            )
-            
-            clob_client = ClobClient(
-                host=self.clob_url,
-                key=config.WALLET_PRIVATE_KEY,
-                chain_id=POLYGON,
-                creds=creds,
-            )
+            from py_clob_client_v2 import OrderArgs, OrderType
+
+            # Initialize the official CLOB client with the same signature type
+            # that was used for the live balance check.
+            clob_client = self._build_clob_client()
             
             # Log order details before submission
             if config.VERBOSE_LOGGING:
@@ -1113,7 +1113,7 @@ class PolymarketClient:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    result = clob_client.post_order(signed_order, orderType=OrderType.GTC)
+                    result = clob_client.post_order(signed_order, order_type=OrderType.GTC)
                     break  # Success, exit retry loop
                 except Exception as retry_error:
                     error_str = str(retry_error).lower()
@@ -1881,15 +1881,194 @@ class PolymarketClient:
     # BALANCE & ACCOUNT METHODS (LIVE MODE)
     # ═══════════════════════════════════════════════════════════════════════════════
 
+    def _effective_signature_type(self) -> int:
+        """Return the signature type currently used for CLOB account calls."""
+        if self._detected_signature_type is not None:
+            return self._detected_signature_type
+        return config.POLYMARKET_SIGNATURE_TYPE
+
+    def _effective_funder_address(self) -> Optional[str]:
+        """Return the address that holds funds for CLOB orders."""
+        return config.POLYMARKET_FUNDER_ADDRESS or config.WALLET_ADDRESS
+
+    def _get_api_creds_values(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Get the freshest API credentials available.
+
+        auth.py may derive fresh credentials at runtime to avoid stale .env keys,
+        so prefer those over the static config values.
+        """
+        creds = getattr(self._auth, "credentials", None)
+        if creds:
+            return creds.api_key, creds.api_secret, creds.passphrase
+        return (
+            config.POLYMARKET_API_KEY,
+            config.POLYMARKET_API_SECRET,
+            config.POLYMARKET_PASSPHRASE,
+        )
+
+    def _signature_types_to_probe(self) -> List[int]:
+        """Probe likely Polymarket account types, keeping the configured value first."""
+        configured = config.POLYMARKET_SIGNATURE_TYPE
+        candidates = [configured, 3, 1, 2, 0]
+        unique = []
+        for value in candidates:
+            if value in (0, 1, 2, 3) and value not in unique:
+                unique.append(value)
+        return unique
+
+    def _build_clob_client(self, signature_type: Optional[int] = None):
+        """
+        Build the official v2 CLOB client for account-sensitive calls.
+
+        Balance/allowance behavior changed to depend heavily on the configured
+        signature type. The SDK keeps that wire format current, so prefer it over
+        hand-built REST calls whenever it is installed.
+        """
+        effective_signature_type = (
+            signature_type if signature_type is not None else self._effective_signature_type()
+        )
+        if (
+            effective_signature_type == 3
+            and not getattr(config, "POLYMARKET_CONFIGURED_FUNDER_ADDRESS", None)
+        ):
+            raise ValueError(
+                "POLYMARKET_FUNDER_ADDRESS or DEPOSIT_WALLET_ADDRESS is required "
+                "when using signature_type=3"
+            )
+
+        from py_clob_client_v2 import ApiCreds, ClobClient
+
+        api_key, api_secret, passphrase = self._get_api_creds_values()
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=passphrase,
+        )
+
+        return ClobClient(
+            host=self.clob_url,
+            chain_id=137,
+            key=config.WALLET_PRIVATE_KEY,
+            creds=creds,
+            signature_type=effective_signature_type,
+            funder=self._effective_funder_address(),
+        )
+
+    def _fetch_balance_allowance_via_sdk(self, signature_type: int) -> Optional[Dict]:
+        """Fetch PUSD balance/allowance through py-clob-client-v2."""
+        try:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+            client = self._build_clob_client(signature_type)
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=signature_type,
+            )
+
+            # The CLOB server caches balances/allowances per signature type.
+            # Updating first prevents a funded account from looking empty after
+            # deposits, withdrawals, approvals, or Polymarket wallet migrations.
+            try:
+                client.update_balance_allowance(params)
+            except Exception as e:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ Could not update balance cache for signature_type={signature_type}: {e}")
+
+            return client.get_balance_allowance(params)
+        except ImportError:
+            if config.VERBOSE_LOGGING:
+                print("⚠️ py-clob-client-v2 is not installed; falling back to direct CLOB balance API")
+            return None
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ SDK balance fetch failed for signature_type={signature_type}: {e}")
+            return None
+
+    def _fetch_balance_allowance_via_rest(self, signature_type: int) -> Optional[Dict]:
+        """Fallback direct REST balance lookup matching the v2 SDK endpoints."""
+        update_url = (
+            f"{self.clob_url}/balance-allowance/update?asset_type=COLLATERAL"
+            f"&signature_type={signature_type}"
+        )
+        self._make_request("GET", update_url, authenticated=True)
+
+        url = (
+            f"{self.clob_url}/balance-allowance?asset_type=COLLATERAL"
+            f"&signature_type={signature_type}"
+        )
+        return self._make_request("GET", url, authenticated=True)
+
+    def _fetch_balance_allowance(self, signature_type: int) -> Optional[Dict]:
+        """Fetch balance/allowance using the SDK first, then REST fallback."""
+        if signature_type == 3 and not getattr(config, "POLYMARKET_CONFIGURED_FUNDER_ADDRESS", None):
+            if config.VERBOSE_LOGGING:
+                print("⚠️ Skipping signature_type=3 probe: no deposit wallet/funder configured")
+            return None
+        result = self._fetch_balance_allowance_via_sdk(signature_type)
+        if result is not None:
+            return result
+        return self._fetch_balance_allowance_via_rest(signature_type)
+
+    def _print_legacy_collateral_hint(self):
+        """Explain the common pUSD migration issue when legacy USDC.e is present."""
+        if time.time() - self._last_collateral_hint < 300:
+            return
+        self._last_collateral_hint = time.time()
+
+        try:
+            from web3 import Web3
+            from web3.middleware import ExtraDataToPOAMiddleware
+
+            rpc_urls = [
+                config.POLYGON_RPC_URL,
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://polygon-rpc.com",
+                "https://rpc.ankr.com/polygon",
+            ]
+            web3 = None
+            for rpc_url in [url for url in rpc_urls if url]:
+                candidate = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                if candidate.is_connected():
+                    web3 = candidate
+                    break
+            if web3 is None:
+                return
+
+            owner = web3.to_checksum_address(self._effective_funder_address())
+            erc20_abi = '[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]'
+            pusd = web3.eth.contract(
+                address=web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"),
+                abi=erc20_abi,
+            )
+            usdce = web3.eth.contract(
+                address=web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                abi=erc20_abi,
+            )
+            pusd_balance = pusd.functions.balanceOf(owner).call() / 1_000_000
+            usdce_balance = usdce.functions.balanceOf(owner).call() / 1_000_000
+
+            if pusd_balance <= 0 and usdce_balance > 0:
+                print(
+                    "⚠️ Detected legacy USDC.e in wallet "
+                    f"(${usdce_balance:.2f}) but no pUSD trading collateral."
+                )
+                print("   Polymarket CLOB now reports pUSD balance. Run:")
+                print("   python3 setup_clob_trading.py wrap all")
+                print("   python3 setup_clob_trading.py approve")
+        except Exception:
+            return
+
     def get_usdc_balance(self) -> Optional[float]:
         """
-        Get the user's USDC balance on Polymarket.
+        Get the user's PUSD balance on Polymarket.
         
         This queries the CLOB API for the current available balance.
         In TEST_MODE, returns None (use virtual balance instead).
         
         Returns:
-            USDC balance as float, or None if error/TEST_MODE
+            PUSD balance as float, or None if error/TEST_MODE
             
         Example:
             >>> client = get_client()
@@ -1908,29 +2087,77 @@ class PolymarketClient:
             return None
         
         try:
-            # Polymarket CLOB API endpoint for balance-allowance
-            # This is the correct endpoint as per py-clob-client
-            # Parameters: asset_type=COLLATERAL for USDC balance
-            url = f"{self.clob_url}/balance-allowance?asset_type=COLLATERAL&signature_type=0"
-            
-            result = self._make_request("GET", url, authenticated=True)
-            
-            if result is None:
+            configured_signature_type = self._effective_signature_type()
+            result = self._fetch_balance_allowance(configured_signature_type)
+            balance = self._parse_balance_response(result) if result is not None else None
+
+            if (
+                balance is not None
+                and balance <= 0
+                and config.POLYMARKET_AUTO_DETECT_SIGNATURE_TYPE
+                and time.time() - self._last_signature_type_probe >= 300
+            ):
+                self._last_signature_type_probe = time.time()
+                for signature_type in self._signature_types_to_probe():
+                    if signature_type == configured_signature_type:
+                        continue
+
+                    probe_result = self._fetch_balance_allowance(signature_type)
+                    probe_balance = (
+                        self._parse_balance_response(probe_result)
+                        if probe_result is not None
+                        else None
+                    )
+
+                    if probe_balance is not None and probe_balance > 0:
+                        self._detected_signature_type = signature_type
+                        balance = probe_balance
+                        if config.VERBOSE_LOGGING:
+                            print(
+                                "✅ Detected funded Polymarket account "
+                                f"with signature_type={signature_type}. "
+                                "Using it for this session."
+                            )
+                            print(
+                                "   Persist this by setting "
+                                f"POLYMARKET_SIGNATURE_TYPE={signature_type} in .env"
+                            )
+                        break
+
+            if balance is None:
                 print("❌ Failed to fetch balance from API")
                 return None
-            
-            # Parse the balance response
-            # The API may return balance in different formats
-            balance = self._parse_balance_response(result)
-            
-            if balance is not None and config.VERBOSE_LOGGING:
-                print(f"💰 USDC Balance: ${balance:.2f}")
-            
+
+            if config.VERBOSE_LOGGING:
+                print(f"💰 PUSD Balance: ${balance:.2f}")
+
+            if balance <= 0:
+                self._print_legacy_collateral_hint()
+
             return balance
             
         except Exception as e:
             print(f"❌ Error fetching balance: {e}")
             return None
+
+    def _amount_to_usdc(self, value: Any, assume_micro_units: bool = False) -> float:
+        """Convert Polymarket numeric amount fields to USDC."""
+        if value is None:
+            return 0.0
+
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned == "":
+                return 0.0
+            if assume_micro_units and cleaned.isdigit():
+                return int(cleaned) / 1_000_000
+            numeric = float(cleaned)
+        else:
+            numeric = float(value)
+
+        if assume_micro_units or numeric > 10000:
+            return numeric / 1_000_000
+        return numeric
     
     def _parse_balance_response(self, response: Dict) -> Optional[float]:
         """
@@ -1947,42 +2174,39 @@ class PolymarketClient:
         try:
             # Try different possible response formats
             
-            # Format 1: Direct balance field
+            if not isinstance(response, dict):
+                return None
+
+            # Format 1: Direct balance field from CLOB balance-allowance.
+            # The official API returns this as micro-USDC.
             if "balance" in response:
-                balance_raw = response["balance"]
-                # Balance might be in smallest units (6 decimals for USDC)
-                if isinstance(balance_raw, str):
-                    balance_raw = float(balance_raw)
-                # Check if balance is in micro-units (> 1000 suggests smallest units)
-                if balance_raw > 10000:
-                    return balance_raw / 1_000_000  # USDC has 6 decimals
-                return float(balance_raw)
+                return self._amount_to_usdc(response["balance"], assume_micro_units=True)
             
             # Format 2: USDC specific field
             if "usdc" in response:
-                return float(response["usdc"])
+                return self._amount_to_usdc(response["usdc"])
             
             # Format 3: Available balance
             if "available" in response:
-                return float(response["available"])
+                return self._amount_to_usdc(response["available"])
             
             # Format 4: Nested balance object
             if "balances" in response:
                 balances = response["balances"]
                 if isinstance(balances, dict):
-                    # Look for USDC balance
+                    # Look for PUSD balance
                     for key in ["USDC", "usdc", "usd"]:
                         if key in balances:
-                            return float(balances[key])
+                            return self._amount_to_usdc(balances[key])
                 elif isinstance(balances, list):
                     # Find USDC in list of balances
                     for bal in balances:
                         if bal.get("asset", "").upper() == "USDC":
-                            return float(bal.get("amount", 0))
+                            return self._amount_to_usdc(bal.get("amount", 0))
             
             # Format 5: Collateral balance (Polymarket specific)
             if "collateral" in response:
-                return float(response["collateral"])
+                return self._amount_to_usdc(response["collateral"], assume_micro_units=True)
             
             print(f"⚠️ Unknown balance response format: {list(response.keys())}")
             return None
@@ -2006,9 +2230,7 @@ class PolymarketClient:
             return None
         
         try:
-            # Use balance-allowance endpoint for COLLATERAL (USDC)
-            url = f"{self.clob_url}/balance-allowance?asset_type=COLLATERAL&signature_type=0"
-            result = self._make_request("GET", url, authenticated=True)
+            result = self._fetch_balance_allowance(self._effective_signature_type())
             
             if result is None:
                 return None
@@ -2019,10 +2241,10 @@ class PolymarketClient:
             # The response should contain balance field
             if isinstance(result, dict):
                 if "balance" in result:
-                    balances["USDC"] = float(result["balance"])
+                    balances["USDC"] = self._amount_to_usdc(result["balance"], assume_micro_units=True)
                 for key, value in result.items():
                     try:
-                        balances[key] = float(value)
+                        balances[key] = self._amount_to_usdc(value)
                     except (ValueError, TypeError):
                         continue
             elif isinstance(result, list):
@@ -2043,7 +2265,7 @@ class PolymarketClient:
     
     def verify_sufficient_balance(self, required_amount: float) -> bool:
         """
-        Verify that the account has sufficient USDC balance for a trade.
+        Verify that the account has sufficient PUSD balance for a trade.
         
         Args:
             required_amount: Amount in USD needed for the trade
@@ -2607,7 +2829,7 @@ class PolymarketClient:
         
         Some Polymarket markets auto-redeem winning positions.
         We can detect this by checking if the position is gone
-        but our USDC balance increased.
+        but our PUSD balance increased.
         """
         try:
             # Check current position
@@ -2618,7 +2840,7 @@ class PolymarketClient:
                 return None
             
             # Position is gone or empty - might be auto-redeemed
-            # We can't verify the USDC credit easily, so assume success
+            # We can't verify the PUSD credit easily, so assume success
             # if the position is gone
             if position is None or position.get("size", 0) == 0:
                 if config.VERBOSE_LOGGING:

@@ -40,6 +40,35 @@ POLYMARKET_PASSPHRASE: Optional[str] = os.getenv("POLYMARKET_PASSPHRASE")
 WALLET_PRIVATE_KEY: Optional[str] = os.getenv("WALLET_PRIVATE_KEY")
 WALLET_ADDRESS: Optional[str] = os.getenv("WALLET_ADDRESS")
 
+# Polymarket signature/funder settings
+# Updated CLOB client requires an explicit signature type and funder address.
+# Signature types:
+#   0 = standalone EOA wallet
+#   1 = Polymarket proxy wallet
+#   2 = Gnosis Safe wallet
+#   3 = deposit wallet / POLY_1271 (recommended for new API users)
+# Defaults match a standard EOA wallet, but proxy/safe/deposit wallets can override this.
+POLYMARKET_SIGNATURE_TYPE: int = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+POLYMARKET_DEPOSIT_WALLET_ADDRESS: Optional[str] = (
+    os.getenv("POLYMARKET_DEPOSIT_WALLET_ADDRESS")
+    or os.getenv("DEPOSIT_WALLET_ADDRESS")
+)
+POLYMARKET_CONFIGURED_FUNDER_ADDRESS: Optional[str] = (
+    os.getenv("POLYMARKET_FUNDER_ADDRESS")
+    or POLYMARKET_DEPOSIT_WALLET_ADDRESS
+)
+POLYMARKET_FUNDER_ADDRESS: Optional[str] = (
+    POLYMARKET_CONFIGURED_FUNDER_ADDRESS
+    or WALLET_ADDRESS
+)
+
+# If the configured signature type returns a zero CLOB balance, probe the other
+# supported account types. Polymarket keeps balance/allowance state separated by
+# signature type, so a stale value here can make a funded account look empty.
+POLYMARKET_AUTO_DETECT_SIGNATURE_TYPE: bool = (
+    os.getenv("POLYMARKET_AUTO_DETECT_SIGNATURE_TYPE", "true").lower() == "true"
+)
+
 # Binance API (optional - public endpoints work without auth for price data)
 BINANCE_API_KEY: Optional[str] = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET: Optional[str] = os.getenv("BINANCE_API_SECRET")
@@ -252,6 +281,10 @@ VERBOSE_LOGGING: bool = os.getenv("VERBOSE_LOGGING", "true").lower() == "true"
 
 # Polymarket CLOB API
 POLYMARKET_API_URL: str = "https://clob.polymarket.com"
+
+# Polygon RPC endpoint used for on-chain balance checks and approvals.
+# Can be overridden in .env if your preferred provider is rate-limited.
+POLYGON_RPC_URL: Optional[str] = os.getenv("POLYGON_RPC_URL")
 POLYMARKET_GAMMA_API_URL: str = "https://gamma-api.polymarket.com"
 
 # Binance public API (no auth needed for price data)
@@ -286,6 +319,10 @@ def validate_config() -> bool:
         errors.append("WALLET_PRIVATE_KEY is required for live trading")
     if not WALLET_ADDRESS:
         errors.append("WALLET_ADDRESS is required for live trading")
+    if POLYMARKET_SIGNATURE_TYPE not in (0, 1, 2, 3):
+        errors.append("POLYMARKET_SIGNATURE_TYPE must be 0, 1, 2, or 3")
+    if POLYMARKET_SIGNATURE_TYPE == 3 and not POLYMARKET_CONFIGURED_FUNDER_ADDRESS:
+        errors.append("POLYMARKET_FUNDER_ADDRESS or DEPOSIT_WALLET_ADDRESS is required for signature type 3")
     
     # Print all errors
     for error in errors:
@@ -316,6 +353,9 @@ def print_config_summary():
     print(f"Min edge required:    {MIN_EDGE_THRESHOLD*100:.1f}%")
     print(f"Bet size:             {BET_SIZE_PERCENT*100:.1f}% of balance")
     print(f"Max bet:              ${MAX_BET_SIZE_USD:.2f}")
+    print(f"Signature type:       {POLYMARKET_SIGNATURE_TYPE}")
+    print(f"Funder address:       {POLYMARKET_FUNDER_ADDRESS or WALLET_ADDRESS or 'N/A'}")
+    print(f"Auto-detect sig type: {'yes' if POLYMARKET_AUTO_DETECT_SIGNATURE_TYPE else 'no'}")
     print(f"Scan interval:        {SCAN_INTERVAL_SECONDS}s")
     print(f"Trade cooldown:       {TRADE_COOLDOWN_SECONDS}s")
     print("="*60 + "\n")

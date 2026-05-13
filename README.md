@@ -325,32 +325,45 @@ Expected output:
 
 | Token | Amount | Purpose |
 |-------|--------|---------|
-| **USDC.e** | $20-50+ | Trading capital |
-| **POL** | 0.5+ POL | Gas fees (~$0.01-0.05 per trade) |
+| **pUSD** | $20-50+ | CLOB trading collateral |
+| **POL** | 0.5+ POL | Gas for setup transactions such as wrapping/approvals |
 
-> **⚠️ CRITICAL**: You must have **USDC.e** (contract: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`), NOT regular USDC! Polymarket only accepts USDC.e.
+> **⚠️ CRITICAL**: Polymarket's current CLOB trading collateral is **pUSD** (proxy contract: `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`). Legacy **USDC.e** in your wallet will not show as CLOB buying power until it is wrapped into pUSD.
 
-#### How to Get USDC.e
+#### Understanding pUSD vs USDC.e
 
-**Option 1: Withdraw from Polymarket Website (Easiest)**
-1. Go to https://polymarket.com
-2. Click **Portfolio** → **Wallet** → **Withdraw**
-3. Withdraw to your wallet address
-4. This automatically gives you USDC.e
+Polymarket migrated its trading collateral to pUSD. You may still have old USDC.e in your Polygon wallet, especially if you previously withdrew from Polymarket or funded the bot before the migration. The bot checks CLOB buying power, so it needs pUSD.
 
-**Option 2: Swap on DEX**
-- If you have regular USDC on Polygon, swap it to USDC.e on [Uniswap](https://app.uniswap.org) or [QuickSwap](https://quickswap.exchange)
+| Token | Contract | Role |
+|-------|----------|------|
+| **pUSD** | `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` | Current Polymarket CLOB collateral |
+| **USDC.e** | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` | Legacy bridged USDC; wrap into pUSD |
+| **Native USDC** | `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359` | Not directly used by this bot |
 
-**Option 3: Bridge from Ethereum**
-- Use the [Polygon Bridge](https://wallet.polygon.technology/) to bridge USDC from Ethereum (becomes USDC.e)
+#### How to Get pUSD
+
+**Option 1: Wrap legacy USDC.e already in your bot wallet**
+
+```bash
+python setup_clob_trading.py wrap all
+```
+
+This uses Polymarket's CollateralOnramp contract to convert USDC.e into pUSD. You need a small amount of POL for the approval/wrap transactions.
+
+**Option 2: Deposit through Polymarket**
+
+Use the current Polymarket deposit flow. Deposits are credited as pUSD for trading. If you later move funds into the bot wallet as USDC.e, run the wrap command above.
 
 #### Set Up CLOB Trading Allowances
 
-Before the bot can trade, you must approve Polymarket's contracts to access your USDC.e:
+Before the bot can trade, you must approve Polymarket's current CLOB contracts to access your pUSD and CTF tokens:
 
 ```bash
 # Check your current status
 python setup_clob_trading.py status
+
+# If status shows USDC.e but pUSD is $0, wrap first
+python setup_clob_trading.py wrap all
 
 # Set up allowances (one-time setup, requires POL for gas)
 python setup_clob_trading.py approve
@@ -364,11 +377,15 @@ CLOB STATUS CHECK
 
 Wallet: 0xYourWalletAddress
 
-CLOB Balance: $XX.XX USDC
+On-chain balances:
+  pUSD: $XX.XX
+  USDC.e: $0.00
+
+CLOB Balance: $XX.XX pUSD
 
 Allowances:
-  CTF Exchange: ✅ Approved
-  Neg Risk CTF Exchange: ✅ Approved
+  CTF Exchange V2: ✅ Approved
+  Neg Risk CTF Exchange V2: ✅ Approved
   Neg Risk Adapter: ✅ Approved
 
 ✅ Ready to trade!
@@ -376,15 +393,15 @@ Allowances:
 
 #### Gas Fees (POL)
 
-Every trade requires a small amount of POL for gas:
+Keep POL in the wallet for on-chain setup and maintenance actions:
 
 | Action | Approx Cost |
 |--------|-------------|
-| Place order | $0.01-0.05 |
-| Cancel order | $0.005-0.02 |
-| Claim winnings | $0.01-0.05 |
+| Wrap USDC.e into pUSD | Small Polygon gas fee |
+| Approve pUSD/CTF contracts | Small Polygon gas fee |
+| Claim/redeem on-chain positions | Small Polygon gas fee |
 
-With **0.5 POL**, you can make **hundreds of trades**. Polygon gas is very cheap!
+Live CLOB orders are signed through the API, but setup and redemption flows still need POL. With **0.5 POL**, you should have plenty for setup and maintenance. Polygon gas is very cheap.
 
 ### Step 6: Start Live Trading
 
@@ -1238,12 +1255,12 @@ for pos in positions:
 
 #### "Insufficient balance"
 
-**Cause:** Wallet doesn't have enough USDC.
+**Cause:** Wallet doesn't have enough pUSD CLOB collateral.
 
 **Solution:** 
-1. Check your Polymarket wallet balance
-2. Deposit more USDC if needed
-3. Ensure you're on Polygon network
+1. Run `python setup_clob_trading.py status`
+2. If you have USDC.e but `pUSD: $0.00`, run `python setup_clob_trading.py wrap all`
+3. Deposit more funds if needed
 
 #### "Authentication failed"
 
@@ -1271,42 +1288,60 @@ pip install -r requirements.txt
 
 #### "CLOB Balance shows $0" (But I Have Money on Polymarket!)
 
-**Cause:** Your funds are in Polymarket's **website proxy wallet**, not in your **direct wallet** where the CLOB API trades from.
+**Cause:** Usually one of these:
+- Your funds are in Polymarket's website/proxy/deposit wallet, not the wallet configured in `.env`
+- Your bot wallet has legacy **USDC.e**, but the current CLOB balance is based on **pUSD**
+- Your `POLYMARKET_SIGNATURE_TYPE` / funder address does not match where the funds are held
 
 **Explanation:**
-- **Polymarket Website** = Funds held by Polymarket (proxy wallet)
-- **CLOB API** = Trades from YOUR wallet directly
+- **pUSD** is the current Polymarket trading collateral.
+- **USDC.e** is legacy bridged USDC. It can exist on-chain in your wallet while the CLOB API still reports `$0.00`.
+- The bot's `setup_clob_trading.py status` command prints both on-chain pUSD/USDC.e balances and the CLOB balance.
 
 **Solution:**
-1. Withdraw funds from Polymarket website to your wallet:
-   - Go to https://polymarket.com → Portfolio → Wallet → Withdraw
-   - Send to your wallet address
-2. Run `python setup_clob_trading.py status` to verify
+```bash
+python setup_clob_trading.py status
+```
+
+If it shows USDC.e but no pUSD:
+
+```bash
+python setup_clob_trading.py wrap all
+python setup_clob_trading.py approve
+python setup_clob_trading.py status
+```
+
+If it shows no funds in the configured wallet, move/deposit funds to the wallet or funder address shown by the status command.
 
 #### "not enough balance / allowance"
 
-**Cause:** Either you don't have USDC.e, or you haven't approved the CLOB contracts.
+**Cause:** Either you don't have pUSD CLOB collateral, or you haven't approved the current CLOB contracts.
 
 **Solution:**
 ```bash
 # Check your status
 python setup_clob_trading.py status
 
+# If pUSD is $0 but USDC.e is present:
+python setup_clob_trading.py wrap all
+
 # If allowances show ❌, run:
 python setup_clob_trading.py approve
 ```
 
-#### "Wrong USDC Type" / Balance Not Detected
+#### "Wrong Currency" / Balance Not Detected
 
-**Cause:** You have regular **USDC** instead of **USDC.e**.
+**Cause:** You have **USDC.e** or native **USDC**, but Polymarket CLOB expects **pUSD**.
 
 **Explanation:**
-- USDC.e: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` ✅ (Polymarket uses this)
-- USDC: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359` ❌ (NOT used by Polymarket)
+- pUSD: `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` ✅ Current CLOB collateral
+- USDC.e: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` ⚠️ Legacy collateral; wrap into pUSD
+- Native USDC: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359` ❌ Not directly used by this bot
 
 **Solution:**
-1. Swap USDC → USDC.e on [Uniswap](https://app.uniswap.org) or [QuickSwap](https://quickswap.exchange)
-2. Or withdraw from Polymarket website (gives you USDC.e automatically)
+1. Run `python setup_clob_trading.py status`
+2. If USDC.e is present, run `python setup_clob_trading.py wrap all`
+3. Then run `python setup_clob_trading.py approve`
 
 #### "Rate limit exhausted" During Setup
 
@@ -1394,27 +1429,25 @@ The CLOB API trades directly from your wallet, not from Polymarket's proxy walle
 
 To use your website balance, withdraw it to your wallet first.
 
-### What's the difference between USDC and USDC.e?
+### What's the difference between pUSD, USDC.e, and USDC?
 
 | Token | Contract | Used By |
 |-------|----------|---------|
-| **USDC.e** | `0x2791Bca1...` | ✅ Polymarket |
-| **USDC** | `0x3c499c54...` | ❌ Not Polymarket |
+| **pUSD** | `0xC011a7E1...` | ✅ Current Polymarket CLOB collateral |
+| **USDC.e** | `0x2791Bca1...` | ⚠️ Legacy bridged USDC; wrap into pUSD |
+| **USDC** | `0x3c499c54...` | ❌ Not directly used by this bot |
 
-USDC.e is "bridged USDC" from Ethereum. Polymarket only accepts USDC.e.
+pUSD is Polymarket USD, the current wrapped collateral token used for CLOB trading. USDC.e is older bridged USDC on Polygon. If your wallet has USDC.e, the bot can detect it, but the CLOB API will still show `$0.00` until you wrap it into pUSD.
 
-### How do I get USDC.e?
+### How do I get pUSD?
 
-1. **Withdraw from Polymarket website** (automatically gives USDC.e)
-2. **Swap on DEX** (Uniswap/QuickSwap: USDC → USDC.e)
-3. **Bridge from Ethereum** (Polygon Bridge converts to USDC.e)
+1. **Wrap USDC.e already in your bot wallet:** `python setup_clob_trading.py wrap all`
+2. **Deposit through Polymarket's current deposit flow**, which credits pUSD for trading
+3. **Check status afterward:** `python setup_clob_trading.py status`
 
 ### Does every trade cost gas (POL)?
 
-Yes, but it's very cheap on Polygon:
-- ~$0.01-0.05 per trade
-- 0.5 POL = hundreds of trades
-- You'll rarely need to top up
+Not in the same way as a normal on-chain swap. CLOB orders are signed and submitted through Polymarket's API, while setup actions such as wrapping USDC.e into pUSD, approving contracts, and some redemption/claim flows are on-chain and need POL. Keep a small POL balance for those actions.
 
 ---
 

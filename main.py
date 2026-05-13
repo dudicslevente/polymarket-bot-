@@ -152,6 +152,10 @@ def run_trading_loop(
             # ─────────────────────────────────────────────────────────────────
             # STEP 2: Check if we can trade (not in cooldown, have balance)
             # ─────────────────────────────────────────────────────────────────
+            if not config.TEST_MODE:
+                # Keep live balance in sync in case funds are deposited/withdrawn while bot runs.
+                execution.refresh_balance()
+
             if execution.is_in_cooldown():
                 if config.VERBOSE_LOGGING:
                     print("⏳ In cooldown, skipping scan")
@@ -160,7 +164,12 @@ def run_trading_loop(
             
             bet_size = calculate_bet_size(execution.state.balance)
             if bet_size <= 0:
-                print("⚠️ Cannot calculate valid bet size, skipping")
+                print(
+                    "⚠️ Cannot calculate valid bet size, skipping "
+                    f"(balance=${execution.state.balance:.2f}, "
+                    f"min_balance=${config.MIN_BALANCE_TO_TRADE:.2f}, "
+                    f"bet_pct={config.BET_SIZE_PERCENT*100:.2f}%)"
+                )
                 time.sleep(config.SCAN_INTERVAL_SECONDS)
                 continue
             

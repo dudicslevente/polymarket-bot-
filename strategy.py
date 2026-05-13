@@ -415,6 +415,12 @@ def calculate_bet_size(current_balance: float) -> float:
     Returns:
         Bet size in USD, or 0 if should not bet
     """
+    # Explicit guard: even with MIN_BALANCE_TO_TRADE=0, zero/negative balance cannot trade.
+    if current_balance <= 0:
+        if config.VERBOSE_LOGGING:
+            print(f"⚠️ Balance is ${current_balance:.2f}; cannot size a live bet")
+        return 0.0
+
     # Check minimum balance
     if current_balance < config.MIN_BALANCE_TO_TRADE:
         if config.VERBOSE_LOGGING:

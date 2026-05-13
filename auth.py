@@ -88,6 +88,25 @@ class PolymarketAuth:
         passphrase = config.POLYMARKET_PASSPHRASE or ""
         wallet_address = config.WALLET_ADDRESS or ""
         private_key = config.WALLET_PRIVATE_KEY or ""
+
+        # In live mode, prefer deriving fresh API credentials from the wallet.
+        # This avoids stale or revoked API keys in .env causing 401 failures.
+        if wallet_address and private_key:
+            try:
+                from py_clob_client_v2 import ClobClient
+
+                client = ClobClient(
+                    host=config.POLYMARKET_API_URL,
+                    chain_id=137,
+                    key=private_key,
+                )
+                derived = client.create_or_derive_api_key()
+                api_key = derived.api_key or api_key
+                api_secret = derived.api_secret or api_secret
+                passphrase = derived.api_passphrase or passphrase
+            except Exception as exc:
+                if config.VERBOSE_LOGGING:
+                    print(f"⚠️ Could not derive fresh Polymarket API credentials: {exc}")
         
         self.credentials = AuthCredentials(
             api_key=api_key,

@@ -43,9 +43,12 @@ ERC20_ABI = """[
 {"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"remaining","type":"uint256"}],"type":"function"}
 ]"""
 
-ERC1155_SET_APPROVAL_ABI = """[{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]"""
+ERC1155_SET_APPROVAL_ABI = """[
+{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},
+{"inputs":[{"internalType":"address","name":"account","type":"address"},{"internalType":"address","name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"}
+]"""
 
-ONRAMP_ABI = """[{"inputs":[{"internalType":"address","name":"_asset","type":"address"},{"internalType":"address","name":"_to","type":"address"},{"internalType":"uint256","name":"_amount"}],"name":"wrap","outputs":[],"stateMutability":"nonpayable","type":"function"}]"""
+ONRAMP_ABI = """[{"inputs":[{"internalType":"address","name":"_asset","type":"address"},{"internalType":"address","name":"_to","type":"address"},{"internalType":"uint256","name":"_amount","type":"uint256"}],"name":"wrap","outputs":[],"stateMutability":"nonpayable","type":"function"}]"""
 
 def check_requirements():
     """Check if required packages are installed."""
@@ -197,45 +200,56 @@ def set_allowances(dry_run=False):
     
     for i, (exchange_addr, exchange_name) in enumerate(EXCHANGES):
         print(f"📋 {exchange_name}:")
+        exchange_checksum = web3.to_checksum_address(exchange_addr)
         
         # pUSD approve
         try:
-            raw_tx = pusd.functions.approve(
-                exchange_addr, int(MAX_INT, 0)
-            ).build_transaction({
-                "chainId": chain_id,
-                "from": pub_key,
-                "nonce": nonce,
-                "gasPrice": web3.eth.gas_price
-            })
-            if send_and_wait(web3, raw_tx, priv_key, "pUSD approve"):
+            pusd_allowance = pusd.functions.allowance(pub_key, exchange_checksum).call()
+            if pusd_allowance > 0:
+                print("  ✅ pUSD approve - Already approved")
                 success_count += 1
-            nonce += 1
-            time.sleep(5)  # Wait between transactions
+            else:
+                raw_tx = pusd.functions.approve(
+                    exchange_checksum, int(MAX_INT, 0)
+                ).build_transaction({
+                    "chainId": chain_id,
+                    "from": pub_key,
+                    "nonce": nonce,
+                    "gasPrice": web3.eth.gas_price
+                })
+                if send_and_wait(web3, raw_tx, priv_key, "pUSD approve"):
+                    success_count += 1
+                nonce += 1
+                time.sleep(5)  # Wait between transactions
         except Exception as e:
             print(f"  ❌ pUSD approve error: {e}")
         
         # CTF setApprovalForAll
         try:
-            raw_tx = ctf.functions.setApprovalForAll(
-                exchange_addr, True
-            ).build_transaction({
-                "chainId": chain_id,
-                "from": pub_key,
-                "nonce": nonce,
-                "gasPrice": web3.eth.gas_price
-            })
-            if send_and_wait(web3, raw_tx, priv_key, "CTF approve"):
+            ctf_approved = ctf.functions.isApprovedForAll(pub_key, exchange_checksum).call()
+            if ctf_approved:
+                print("  ✅ CTF approve - Already approved")
                 success_count += 1
-            nonce += 1
-            time.sleep(5)  # Wait between transactions
+            else:
+                raw_tx = ctf.functions.setApprovalForAll(
+                    exchange_checksum, True
+                ).build_transaction({
+                    "chainId": chain_id,
+                    "from": pub_key,
+                    "nonce": nonce,
+                    "gasPrice": web3.eth.gas_price
+                })
+                if send_and_wait(web3, raw_tx, priv_key, "CTF approve"):
+                    success_count += 1
+                nonce += 1
+                time.sleep(5)  # Wait between transactions
         except Exception as e:
             print(f"  ❌ CTF approve error: {e}")
         
         print()
         
         # Extra delay between exchange approvals
-        if i < len(exchanges) - 1:
+        if i < len(EXCHANGES) - 1:
             print("  ⏳ Waiting 10s before next exchange...")
             time.sleep(10)
     

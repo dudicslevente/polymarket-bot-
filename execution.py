@@ -70,7 +70,7 @@ class Trade:
     token_id: Optional[str] = None  # Token ID we bought - needed for redemption
     condition_id: Optional[str] = None  # Market condition ID for resolution
     redemption_status: Optional[str] = None  # "PENDING", "REDEEMED", "FAILED"
-    redemption_amount: Optional[float] = None  # Amount redeemed in USDC
+    redemption_amount: Optional[float] = None  # Amount redeemed in pUSD
 
 
 @dataclass
@@ -940,7 +940,7 @@ class ExecutionEngine:
                     if not redemption_result.get("needs_manual_redemption"):
                         trade.redemption_status = "REDEEMED"
                         trade.redemption_amount = redemption_result.get("amount_usdc", payout)
-                        print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                        print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} pUSD")
                     else:
                         print(f"⚠️ Shares require manual redemption on Polymarket: {trade.filled_shares} shares")
                 else:
@@ -1164,7 +1164,7 @@ class ExecutionEngine:
                     if not redemption_result.get("needs_manual_redemption"):
                         trade.redemption_status = "REDEEMED"
                         trade.redemption_amount = redemption_result.get("amount_usdc", payout)
-                        print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} USDC")
+                        print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} pUSD")
                     else:
                         print(f"⚠️ Shares require manual redemption on Polymarket: {trade.filled_shares} shares")
                 else:

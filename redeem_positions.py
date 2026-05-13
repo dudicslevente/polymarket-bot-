@@ -4,7 +4,7 @@ POLYMARKET POSITION REDEMPTION SCRIPT
 
 This script redeems all winning positions by calling the CTF contract
 on Polygon. After a market resolves, winning shares can be exchanged
-for USDC on-chain.
+for pUSD on-chain.
 
 REQUIREMENTS:
 - POL in wallet for gas fees (~0.01-0.05 POL per redemption)
@@ -109,7 +109,7 @@ def main():
     print("\n" + "-"*50)
     print("⚠️ REDEMPTION CONFIRMATION")
     print("-"*50)
-    print(f"\nYou are about to redeem ${total_value:.2f} worth of positions.")
+    print(f"\nYou are about to redeem ${total_value:.2f} worth of positions into pUSD.")
     print("This will execute blockchain transactions (requires gas).\n")
     
     confirm = input("Type 'REDEEM' to proceed: ")

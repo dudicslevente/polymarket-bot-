@@ -2010,6 +2010,38 @@ class PolymarketClient:
             return result
         return self._fetch_balance_allowance_via_rest(signature_type)
 
+    def _connect_polygon(self, timeout: int = 60):
+        """Connect to Polygon using the configured RPC plus public fallbacks."""
+        try:
+            from web3 import Web3
+            from web3.middleware import ExtraDataToPOAMiddleware
+        except ImportError:
+            print("❌ web3 package not installed. Install with: pip install web3")
+            return None
+
+        rpc_urls = [
+            config.POLYGON_RPC_URL,
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon-rpc.com",
+            "https://rpc.ankr.com/polygon",
+        ]
+
+        for rpc_url in [url for url in rpc_urls if url]:
+            try:
+                web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": timeout}))
+                web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                if web3.is_connected():
+                    if config.VERBOSE_LOGGING:
+                        print(f"   🔗 Connected to Polygon RPC: {rpc_url}")
+                    return web3
+            except Exception as e:
+                if config.VERBOSE_LOGGING:
+                    print(f"   ⚠️ Polygon RPC failed ({rpc_url}): {e}")
+
+        print("❌ Cannot redeem: Failed to connect to Polygon network")
+        print("   Set POLYGON_RPC_URL in .env or try again later.")
+        return None
+
     def _print_legacy_collateral_hint(self):
         """Explain the common pUSD migration issue when legacy USDC.e is present."""
         if time.time() - self._last_collateral_hint < 300:
@@ -2017,22 +2049,7 @@ class PolymarketClient:
         self._last_collateral_hint = time.time()
 
         try:
-            from web3 import Web3
-            from web3.middleware import ExtraDataToPOAMiddleware
-
-            rpc_urls = [
-                config.POLYGON_RPC_URL,
-                "https://polygon-bor-rpc.publicnode.com",
-                "https://polygon-rpc.com",
-                "https://rpc.ankr.com/polygon",
-            ]
-            web3 = None
-            for rpc_url in [url for url in rpc_urls if url]:
-                candidate = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-                candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-                if candidate.is_connected():
-                    web3 = candidate
-                    break
+            web3 = self._connect_polygon(timeout=10)
             if web3 is None:
                 return
 
@@ -2530,9 +2547,9 @@ class PolymarketClient:
         """
         Redeem winning shares on-chain via the CTF (Conditional Token Framework) contract.
         
-        After a market resolves, winning shares can be redeemed for USDC by calling
+        After a market resolves, winning shares can be redeemed for pUSD by calling
         the `redeemPositions` function on the CTF contract. This burns the conditional
-        tokens and returns the underlying USDC collateral.
+        tokens and returns the underlying collateral.
         
         Args:
             token_id: The token ID of the winning position
@@ -2647,7 +2664,7 @@ class PolymarketClient:
         Execute on-chain redemption via the CTF contract.
         
         Calls `redeemPositions` on the Conditional Token Framework (CTF) contract
-        to burn winning outcome tokens and receive USDC collateral.
+        to burn winning outcome tokens and receive pUSD collateral.
         
         Args:
             condition_id: The condition ID of the resolved market
@@ -2664,7 +2681,8 @@ class PolymarketClient:
             
             # Contract addresses (Polygon Mainnet)
             CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-            USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+            USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
             
             # CTF redeemPositions ABI
             CTF_ABI = [
@@ -2679,6 +2697,37 @@ class PolymarketClient:
                     "outputs": [],
                     "stateMutability": "nonpayable",
                     "type": "function"
+                },
+                {
+                    "inputs": [
+                        {"name": "parentCollectionId", "type": "bytes32"},
+                        {"name": "conditionId", "type": "bytes32"},
+                        {"name": "indexSet", "type": "uint256"}
+                    ],
+                    "name": "getCollectionId",
+                    "outputs": [{"name": "", "type": "bytes32"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                },
+                {
+                    "inputs": [
+                        {"name": "collateralToken", "type": "address"},
+                        {"name": "collectionId", "type": "bytes32"}
+                    ],
+                    "name": "getPositionId",
+                    "outputs": [{"name": "", "type": "uint256"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                },
+                {
+                    "inputs": [
+                        {"name": "account", "type": "address"},
+                        {"name": "id", "type": "uint256"}
+                    ],
+                    "name": "balanceOf",
+                    "outputs": [{"name": "", "type": "uint256"}],
+                    "stateMutability": "view",
+                    "type": "function"
                 }
             ]
             
@@ -2690,13 +2739,8 @@ class PolymarketClient:
                 print("❌ Cannot redeem: WALLET_PRIVATE_KEY and WALLET_ADDRESS required")
                 return None
             
-            # Connect to Polygon
-            rpc_url = getattr(config, 'POLYGON_RPC_URL', "https://polygon-bor-rpc.publicnode.com")
-            web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
-            web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-            
-            if not web3.is_connected():
-                print("❌ Cannot redeem: Failed to connect to Polygon network")
+            web3 = self._connect_polygon(timeout=60)
+            if web3 is None:
                 return None
             
             wallet_address = web3.to_checksum_address(wallet_address)
@@ -2717,65 +2761,127 @@ class PolymarketClient:
             # Parent collection ID is null (bytes32 zero) for Polymarket
             parent_collection_id = bytes(32)
             
-            # Index sets: [1, 2] represents YES and NO outcomes
-            # The contract will only pay out for winning outcomes
-            index_sets = [1, 2]
-            
             print(f"   🔗 Executing on-chain redemption...")
             print(f"      Condition ID: {condition_id[:16]}...")
             print(f"      Shares: {shares:.4f}")
             
-            # Build transaction
-            nonce = web3.eth.get_transaction_count(wallet_address)
-            gas_price = web3.eth.gas_price
-            
-            tx = ctf_contract.functions.redeemPositions(
-                web3.to_checksum_address(USDC_ADDRESS),
-                parent_collection_id,
-                condition_id_bytes,
-                index_sets
-            ).build_transaction({
-                'from': wallet_address,
-                'nonce': nonce,
-                'gas': 200000,  # Estimate, will be adjusted
-                'gasPrice': gas_price,
-                'chainId': 137  # Polygon Mainnet
-            })
-            
-            # Estimate gas
-            try:
-                gas_estimate = web3.eth.estimate_gas(tx)
-                tx['gas'] = int(gas_estimate * 1.2)  # Add 20% buffer
-            except Exception as e:
-                print(f"   ⚠️ Gas estimation failed: {e}")
-                # Continue with default gas
-            
-            # Sign and send transaction
-            signed_tx = web3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            tx_hash_hex = tx_hash.hex()
-            
-            print(f"   📤 Transaction sent: {tx_hash_hex}")
-            print(f"   ⏳ Waiting for confirmation...")
-            
-            # Wait for transaction receipt
-            receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            
-            if receipt['status'] == 1:
-                print(f"   ✅ Redemption successful!")
-                print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
-                
+            token_id_int = int(token_id)
+            token_balance_before = ctf_contract.functions.balanceOf(
+                wallet_address,
+                token_id_int,
+            ).call()
+            if token_balance_before <= 0:
+                print("   ℹ️ Position already redeemed or no longer held on-chain")
                 return {
                     "success": True,
-                    "amount_usdc": shares,  # Winning shares = USDC
-                    "shares_redeemed": shares,
-                    "method": "onchain_redemption",
-                    "tx_hash": tx_hash_hex,
-                    "gas_used": receipt['gasUsed']
+                    "amount_usdc": 0,
+                    "shares_redeemed": 0,
+                    "method": "already_redeemed",
                 }
-            else:
-                print(f"   ❌ Transaction failed (reverted)")
-                return None
+
+            collateral_candidates = [
+                ("pUSD", PUSD_ADDRESS),
+                ("legacy USDC.e", USDCE_ADDRESS),
+                ("CTF collateral adapter", "0xAdA100Db00Ca00073811820692005400218FcE1f"),
+                ("Neg-risk CTF collateral adapter", "0xadA2005600Dec949baf300f4C6120000bDB6eAab"),
+            ]
+
+            matched_candidates = []
+            for index_set in [1, 2]:
+                collection_id = ctf_contract.functions.getCollectionId(
+                    parent_collection_id,
+                    condition_id_bytes,
+                    index_set,
+                ).call()
+                for collateral_name, collateral_address in collateral_candidates:
+                    position_id = ctf_contract.functions.getPositionId(
+                        web3.to_checksum_address(collateral_address),
+                        collection_id,
+                    ).call()
+                    if position_id == token_id_int:
+                        matched_candidates.append((collateral_name, collateral_address, index_set))
+
+            if not matched_candidates:
+                print("   ⚠️ Could not derive collateral/index set from token ID; trying safe fallbacks")
+                matched_candidates = [
+                    (collateral_name, collateral_address, index_set)
+                    for collateral_name, collateral_address in collateral_candidates
+                    for index_set in [1, 2]
+                ]
+
+            last_error = None
+            for collateral_name, collateral_address, index_set in matched_candidates:
+                try:
+                    print(f"      Collateral: {collateral_name} | indexSet={index_set}")
+                    nonce = web3.eth.get_transaction_count(wallet_address)
+                    gas_price = web3.eth.gas_price
+
+                    tx = ctf_contract.functions.redeemPositions(
+                        web3.to_checksum_address(collateral_address),
+                        parent_collection_id,
+                        condition_id_bytes,
+                        [index_set]
+                    ).build_transaction({
+                        'from': wallet_address,
+                        'nonce': nonce,
+                        'gasPrice': gas_price,
+                        'chainId': 137
+                    })
+
+                    try:
+                        gas_estimate = web3.eth.estimate_gas(tx)
+                        tx['gas'] = int(gas_estimate * 1.2)
+                    except Exception as e:
+                        last_error = e
+                        print(f"      ⚠️ {collateral_name} redemption not estimable: {e}")
+                        continue
+
+                    signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+                    tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    tx_hash_hex = tx_hash.hex()
+
+                    print(f"   📤 Transaction sent: {tx_hash_hex}")
+                    print(f"   ⏳ Waiting for confirmation...")
+
+                    receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+
+                    if receipt['status'] == 1:
+                        token_balance_after = ctf_contract.functions.balanceOf(
+                            wallet_address,
+                            token_id_int,
+                        ).call()
+                        shares_burned = max(token_balance_before - token_balance_after, 0) / 1_000_000
+
+                        if shares_burned <= 0:
+                            print("   ⚠️ Transaction succeeded but did not burn the winning position")
+                            print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
+                            last_error = "redemption transaction did not burn shares"
+                            continue
+
+                        print(f"   ✅ Redemption successful!")
+                        print(f"      Burned: {shares_burned:.4f} shares")
+                        print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
+
+                        return {
+                            "success": True,
+                            "amount_usdc": shares_burned,
+                            "shares_redeemed": shares_burned,
+                            "method": "onchain_redemption",
+                            "collateral": collateral_name,
+                            "index_set": index_set,
+                            "tx_hash": tx_hash_hex,
+                            "gas_used": receipt['gasUsed']
+                        }
+
+                    print(f"   ❌ Transaction failed (reverted)")
+                    last_error = "transaction reverted"
+                except Exception as e:
+                    last_error = e
+                    print(f"      ⚠️ {collateral_name} redemption failed: {e}")
+
+            if last_error:
+                print(f"   ❌ Redemption failed for all collateral options: {last_error}")
+            return None
                 
         except ImportError:
             print("❌ web3 package not installed. Install with: pip install web3")
@@ -2869,7 +2975,7 @@ class PolymarketClient:
         Positions with current_price ~= 0 are LOSING positions and are skipped.
         
         For each winning position, this method calls the CTF contract's
-        `redeemPositions` function to burn tokens and receive USDC.
+        `redeemPositions` function to burn tokens and receive pUSD.
         
         Returns:
             Dict with summary of redemption results
@@ -2933,7 +3039,7 @@ class PolymarketClient:
             if cur_price < 0.10:
                 # This is a LOSING position (resolved to ~0) - no value to redeem
                 losing_positions += 1
-                if config.VERBOSE_LOGGING:
+                if config.VERBOSE_LOGGING and getattr(config, "REDEMPTION_VERBOSE_LOSSES", False):
                     print(f"   ❌ LOSS: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - skipping")
                 continue
             elif cur_price < 0.90:
@@ -2961,6 +3067,8 @@ class PolymarketClient:
                     amount = result.get("amount_usdc", 0)
                     total_redeemed += amount
                     print(f"      ✅ Redeemed ${amount:.2f} on-chain")
+                    if result.get("collateral") == "legacy USDC.e":
+                        print("      ℹ️ Redeemed into USDC.e. Run 'python3 setup_clob_trading.py wrap all' to convert it to pUSD CLOB balance.")
                 elif result.get("method") == "already_redeemed":
                     already_redeemed += 1
                     print(f"      ✅ Already redeemed")

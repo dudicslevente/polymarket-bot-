@@ -263,6 +263,10 @@ CANCEL_UNFILLED_ORDERS: bool = os.getenv("CANCEL_UNFILLED_ORDERS", "true").lower
 # This is a safety net to ensure no winning shares are left unredeemed
 REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "300"))  # 5 minutes
 
+# Print every losing position during redemption scans.
+# Disabled by default because old losing positions can make redemption logs very noisy.
+REDEMPTION_VERBOSE_LOSSES: bool = os.getenv("REDEMPTION_VERBOSE_LOSSES", "false").lower() == "true"
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING

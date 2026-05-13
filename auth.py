@@ -95,12 +95,28 @@ class PolymarketAuth:
             try:
                 from py_clob_client_v2 import ClobClient
 
+                if (
+                    config.POLYMARKET_SIGNATURE_TYPE == 3
+                    and not config.POLYMARKET_CONFIGURED_FUNDER_ADDRESS
+                ):
+                    raise ValueError(
+                        "POLYMARKET_FUNDER_ADDRESS or DEPOSIT_WALLET_ADDRESS is required "
+                        "for signature type 3"
+                    )
+
                 client = ClobClient(
                     host=config.POLYMARKET_API_URL,
                     chain_id=137,
                     key=private_key,
+                    signature_type=config.POLYMARKET_SIGNATURE_TYPE,
+                    funder=config.POLYMARKET_FUNDER_ADDRESS,
                 )
-                derived = client.create_or_derive_api_key()
+                try:
+                    derived = client.derive_api_key()
+                except Exception:
+                    if api_key and api_secret and passphrase:
+                        raise
+                    derived = client.create_or_derive_api_key()
                 api_key = derived.api_key or api_key
                 api_secret = derived.api_secret or api_secret
                 passphrase = derived.api_passphrase or passphrase
@@ -318,7 +334,11 @@ class PolymarketAuth:
         """
         try:
             from eth_account import Account
-            from eth_account.messages import encode_structured_data
+            try:
+                from eth_account.messages import encode_structured_data
+            except ImportError:
+                from eth_account.messages import encode_typed_data
+                encode_structured_data = lambda typed_data: encode_typed_data(full_message=typed_data)
             
             # EIP-712 domain for CLOB authentication
             domain = {

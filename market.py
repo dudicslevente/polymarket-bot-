@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+from decimal import Decimal, ROUND_CEILING
 
 import config
 from auth import get_auth, reset_auth, AuthLevel, AuthError
@@ -1009,10 +1010,6 @@ class PolymarketClient:
             print(f"❌ Order amount ${amount_usd:.2f} below minimum ${config.MIN_BET_SIZE_USD:.2f}")
             return None
         
-        # Verify we have sufficient balance
-        if not self.verify_sufficient_balance(amount_usd):
-            return None
-        
         # Get current market prices
         prices = self.get_best_prices(market, side_normalized)
         if not prices:
@@ -1077,16 +1074,22 @@ class PolymarketClient:
         if shares <= 0:
             print(f"❌ Invalid share calculation: {shares}")
             return None
+
+        # Verify after any minimum-size adjustment so we check the real spend.
+        if not self.verify_sufficient_balance(amount_usd):
+            return None
         
         # ─────────────────────────────────────────────────────────────────────
         # USE OFFICIAL py-clob-client FOR ORDER CREATION AND SUBMISSION
         # ─────────────────────────────────────────────────────────────────────
         try:
-            from py_clob_client_v2 import OrderArgs, OrderType
+            from py_clob_client_v2 import MarketOrderArgs, OrderType
 
             # Initialize the official CLOB client with the same signature type
             # that was used for the live balance check.
             clob_client = self._build_clob_client()
+            options = self._get_create_order_options(clob_client, token_id)
+            order_price = self._round_buy_price_to_tick(order_price, options.tick_size or "0.01")
             
             # Log order details before submission
             if config.VERBOSE_LOGGING:
@@ -1096,24 +1099,27 @@ class PolymarketClient:
                 print(f"   Amount: ${amount_usd:.2f}")
                 print(f"   Price: {order_price:.4f}")
                 print(f"   Shares: {shares:.2f}")
+                print(f"   Tick size: {options.tick_size} | negRisk: {options.neg_risk}")
             
-            # Create the order using the official client
-            order_args = OrderArgs(
-                price=round(order_price, 2),  # Price must be rounded to tick size
-                size=shares,
-                side="BUY",  # We're always buying the outcome we want
+            # Create a marketable FOK buy. For BUY market orders, `amount`
+            # is dollars to spend and `price` is the worst acceptable price.
+            order_args = MarketOrderArgs(
                 token_id=token_id,
+                amount=round(amount_usd, 2),
+                side="BUY",  # We're always buying the outcome we want
+                price=order_price,
+                order_type=OrderType.FOK,
             )
             
             # Create and sign the order
-            signed_order = clob_client.create_order(order_args)
+            signed_order = clob_client.create_market_order(order_args, options)
             
             # Post the order to the CLOB with retry logic for network timeouts
             result = None
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    result = clob_client.post_order(signed_order, order_type=OrderType.GTC)
+                    result = clob_client.post_order(signed_order, order_type=OrderType.FOK)
                     break  # Success, exit retry loop
                 except Exception as retry_error:
                     error_str = str(retry_error).lower()
@@ -1131,8 +1137,16 @@ class PolymarketClient:
             
             # Parse the response
             if result and isinstance(result, dict):
-                if result.get("success") or result.get("orderID") or result.get("order_id"):
+                if self._order_response_success(result):
                     order_id = result.get("orderID") or result.get("order_id") or result.get("id")
+                    if not order_id:
+                        error_msg = "CLOB accepted response did not include an order ID"
+                        print(f"❌ Order placement failed: {error_msg}")
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "raw_response": result,
+                        }
                     print(f"✅ Order placed successfully!")
                     print(f"   Order ID: {order_id}")
                     self.mark_as_traded(market)
@@ -1146,7 +1160,7 @@ class PolymarketClient:
                         "raw_response": result,
                     }
                 else:
-                    error_msg = result.get("error") or result.get("message") or str(result)
+                    error_msg = self._order_response_error(result) or str(result)
                     print(f"❌ Order placement failed: {error_msg}")
                     return {
                         "success": False,
@@ -1229,6 +1243,92 @@ class PolymarketClient:
         order_price = min(ask_price * 1.001, 0.99)  # Cap at 0.99
         
         return round(order_price, 4)
+
+    def _get_create_order_options(self, clob_client, token_id: str):
+        """Fetch current market order options used by the v2 order builder."""
+        from py_clob_client_v2 import PartialCreateOrderOptions
+
+        tick_size = "0.01"
+        neg_risk = False
+
+        try:
+            fetched_tick = clob_client.get_tick_size(token_id)
+            if fetched_tick:
+                tick_size = str(fetched_tick)
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Could not fetch tick size for token {token_id[:16]}...: {e}")
+
+        try:
+            neg_risk = bool(clob_client.get_neg_risk(token_id))
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Could not fetch negRisk for token {token_id[:16]}...: {e}")
+
+        return PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+
+    def _round_buy_price_to_tick(self, price: float, tick_size: str) -> float:
+        """Round a buy worst-price upward to the market tick without crossing 1.0."""
+        tick = Decimal(str(tick_size))
+        value = Decimal(str(price))
+        rounded = (value / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+        max_price = Decimal("1") - tick
+        if rounded > max_price:
+            rounded = max_price
+        if rounded < tick:
+            rounded = tick
+        return float(rounded)
+
+    def _order_response_error(self, response: Dict) -> Optional[str]:
+        """Extract a failure reason from CLOB order responses."""
+        for key in ("error", "errorMsg", "message", "reason"):
+            value = response.get(key)
+            if value:
+                return str(value)
+        return None
+
+    def _order_response_success(self, response: Dict) -> bool:
+        """Return True only when the CLOB response explicitly indicates acceptance."""
+        if not isinstance(response, dict):
+            return False
+
+        success_value = response.get("success")
+        if success_value is False:
+            return False
+        if isinstance(success_value, str) and success_value.lower() == "false":
+            return False
+
+        status = str(
+            response.get("status")
+            or response.get("orderStatus")
+            or response.get("state")
+            or ""
+        ).upper()
+        terminal_failure = {"FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"}
+        if status in terminal_failure:
+            return False
+
+        if success_value is True:
+            return True
+        if isinstance(success_value, str) and success_value.lower() == "true":
+            return True
+
+        order_id = (
+            response.get("orderID")
+            or response.get("order_id")
+            or response.get("id")
+            or response.get("orderId")
+        )
+        accepted_status = {
+            "SUBMITTED",
+            "OPEN",
+            "PENDING",
+            "LIVE",
+            "MATCHED",
+            "FILLED",
+            "PARTIAL",
+        }
+        return bool(order_id and (not status or status in accepted_status))
     
     def _parse_order_response(
         self, 
@@ -1261,13 +1361,10 @@ class PolymarketClient:
         }
         
         try:
-            # Check for error responses
-            if "error" in response:
-                result["error"] = response["error"]
-                return result
-            
-            if "message" in response and "error" in response.get("message", "").lower():
-                result["error"] = response["message"]
+            # Check for explicit failure responses first. Newer CLOB responses can
+            # include an order id alongside success=false/errorMsg.
+            if not self._order_response_success(response):
+                result["error"] = self._order_response_error(response) or str(response)
                 return result
             
             # Extract order ID (various possible field names)
@@ -1287,9 +1384,7 @@ class PolymarketClient:
             )
             result["status"] = status.upper() if isinstance(status, str) else status
             
-            # Check if order was accepted
-            if order_id or status in ["SUBMITTED", "OPEN", "PENDING", "FILLED", "PARTIAL"]:
-                result["success"] = True
+            result["success"] = True
             
             # Extract fill information if available
             if "filledSize" in response:
@@ -1719,40 +1814,39 @@ class PolymarketClient:
         """
         try:
             # Use the data-api trades endpoint
-            wallet_address = config.WALLET_ADDRESS
-            if not wallet_address:
-                return None
-            
             data_api_url = "https://data-api.polymarket.com"
             url = f"{data_api_url}/trades"
-            params = {
-                "user": wallet_address.lower(),
-                "limit": 20,  # Check last 20 trades
-            }
-            
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            trades = response.json()
-            
-            if not isinstance(trades, list):
-                trades = trades.get("trades", []) if isinstance(trades, dict) else []
-            
-            # Look for a recent trade with our token
-            for trade in trades:
-                trade_token = (
-                    trade.get("asset") or 
-                    trade.get("token_id") or 
-                    trade.get("tokenId") or
-                    ""
-                )
-                if trade_token == token_id:
-                    # Found a matching trade!
-                    return {
-                        "token_id": trade_token,
-                        "size": float(trade.get("size") or trade.get("amount") or 0),
-                        "price": float(trade.get("price") or 0),
-                        "timestamp": trade.get("timestamp") or trade.get("createdAt"),
-                    }
+
+            for user_address in self._account_addresses_for_data_api():
+                params = {
+                    "user": user_address,
+                    "limit": 20,  # Check last 20 trades
+                }
+                
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                trades = response.json()
+                
+                if not isinstance(trades, list):
+                    trades = trades.get("trades", []) if isinstance(trades, dict) else []
+                
+                # Look for a recent trade with our token
+                for trade in trades:
+                    trade_token = (
+                        trade.get("asset") or 
+                        trade.get("token_id") or 
+                        trade.get("tokenId") or
+                        ""
+                    )
+                    if trade_token == token_id:
+                        # Found a matching trade!
+                        return {
+                            "token_id": trade_token,
+                            "size": float(trade.get("size") or trade.get("amount") or 0),
+                            "price": float(trade.get("price") or 0),
+                            "timestamp": trade.get("timestamp") or trade.get("createdAt"),
+                            "owner": user_address,
+                        }
             
             return None
             
@@ -1890,6 +1984,27 @@ class PolymarketClient:
     def _effective_funder_address(self) -> Optional[str]:
         """Return the address that holds funds for CLOB orders."""
         return config.POLYMARKET_FUNDER_ADDRESS or config.WALLET_ADDRESS
+
+    def _account_addresses_for_data_api(self) -> List[str]:
+        """
+        Return possible account addresses for Data API lookups.
+
+        Newer Polymarket setups can keep CLOB funds/positions under a funder or
+        deposit wallet while the signer remains WALLET_ADDRESS. Querying both
+        keeps fills and redemptions visible for EOA and migrated accounts.
+        """
+        candidates = [
+            self._effective_funder_address(),
+            config.WALLET_ADDRESS,
+        ]
+        unique = []
+        for address in candidates:
+            if not address:
+                continue
+            normalized = address.lower()
+            if normalized not in unique:
+                unique.append(normalized)
+        return unique
 
     def _get_api_creds_values(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """
@@ -2341,38 +2456,42 @@ class PolymarketClient:
             return None
         
         try:
-            # Use Polymarket data-api for positions - this is the correct endpoint
-            # The CLOB API does NOT have a /positions endpoint
-            wallet_address = config.WALLET_ADDRESS
-            if not wallet_address:
-                print("❌ WALLET_ADDRESS not configured")
+            account_addresses = self._account_addresses_for_data_api()
+            if not account_addresses:
+                print("❌ WALLET_ADDRESS/POLYMARKET_FUNDER_ADDRESS not configured")
                 return None
             
             # Data API endpoint for user positions
             data_api_url = "https://data-api.polymarket.com"
             url = f"{data_api_url}/positions"
-            params = {"user": wallet_address.lower()}
-            
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            result = response.json()
-            
+            seen_tokens = set()
             positions = []
-            
-            # Handle the data-api response format
-            if isinstance(result, list):
-                for item in result:
-                    if isinstance(item, dict):
-                        parsed = self._parse_data_api_position(item)
-                        # Only include positions with actual shares
-                        if parsed.get("size", 0) > 0:
-                            positions.append(parsed)
-            elif isinstance(result, dict):
-                if "positions" in result:
-                    for item in result["positions"]:
-                        parsed = self._parse_data_api_position(item)
-                        if parsed.get("size", 0) > 0:
-                            positions.append(parsed)
+
+            for account_address in account_addresses:
+                params = {"user": account_address}
+                
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                result = response.json()
+                
+                raw_items = []
+                if isinstance(result, list):
+                    raw_items = result
+                elif isinstance(result, dict) and "positions" in result:
+                    raw_items = result["positions"]
+                
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        continue
+                    parsed = self._parse_data_api_position(item)
+                    parsed["owner"] = account_address
+                    token_id = parsed.get("token_id")
+                    if parsed.get("size", 0) <= 0 or not token_id:
+                        continue
+                    if token_id in seen_tokens:
+                        continue
+                    seen_tokens.add(token_id)
+                    positions.append(parsed)
             
             if config.VERBOSE_LOGGING:
                 if positions:
@@ -2426,7 +2545,7 @@ class PolymarketClient:
             "initial_value": float(data.get("initialValue") or 0),
             "cash_pnl": float(data.get("cashPnl") or 0),
             "percent_pnl": float(data.get("percentPnl") or 0),
-            "redeemable": data.get("redeemable", False),
+            "redeemable": data.get("redeemable"),
             "end_date": data.get("endDate"),
             "raw": data  # Keep raw data for debugging
         }
@@ -2601,6 +2720,7 @@ class PolymarketClient:
         current_shares = position.get("size", 0)
         cur_price = position.get("current_price", 0)
         condition_id = position.get("condition_id") or position.get("market_id")
+        redeemable = position.get("redeemable")
         
         # If current price is 0.0, it's a losing position (no redemption needed)
         if cur_price == 0:
@@ -2613,7 +2733,7 @@ class PolymarketClient:
             }
         
         # If current price is 1.0, it's a winning position - attempt on-chain redemption
-        if cur_price == 1.0 or cur_price >= 0.99:
+        if (cur_price == 1.0 or cur_price >= 0.99) and redeemable is not False:
             estimated_value = current_shares * 1.0
             print(f"💰 Winning position found: {current_shares:.4f} shares (~${estimated_value:.2f})")
             
@@ -2623,6 +2743,8 @@ class PolymarketClient:
                     try:
                         result = self._execute_onchain_redemption(condition_id, token_id, current_shares)
                         if result and result.get("success"):
+                            return result
+                        if result and result.get("needs_manual_redemption"):
                             return result
                         if attempt < max_retries - 1:
                             print(f"⚠️ Redemption attempt {attempt + 1} failed, retrying in 15s...")
@@ -2651,7 +2773,7 @@ class PolymarketClient:
             "amount_usdc": 0,
             "shares_redeemed": 0,
             "method": "market_not_resolved",
-            "message": f"Market may not be resolved yet (price: {cur_price})"
+            "message": f"Market may not be resolved/redeemable yet (price: {cur_price}, redeemable={redeemable})"
         }
     
     def _execute_onchain_redemption(
@@ -2744,6 +2866,12 @@ class PolymarketClient:
                 return None
             
             wallet_address = web3.to_checksum_address(wallet_address)
+            funder_address = self._effective_funder_address()
+            funder_checksum = (
+                web3.to_checksum_address(funder_address)
+                if funder_address
+                else wallet_address
+            )
             
             # Create CTF contract instance
             ctf_contract = web3.eth.contract(
@@ -2771,6 +2899,25 @@ class PolymarketClient:
                 token_id_int,
             ).call()
             if token_balance_before <= 0:
+                funder_balance = 0
+                if funder_checksum != wallet_address:
+                    funder_balance = ctf_contract.functions.balanceOf(
+                        funder_checksum,
+                        token_id_int,
+                    ).call()
+
+                if funder_balance > 0:
+                    print("   ⚠️ Winning position is held by the funder/deposit wallet, not the signer wallet.")
+                    print("   Automatic direct redemption requires the signer wallet to hold the CTF tokens.")
+                    return {
+                        "success": False,
+                        "amount_usdc": 0,
+                        "shares_redeemed": 0,
+                        "needs_manual_redemption": True,
+                        "method": "deposit_wallet_manual_required",
+                        "message": "Redeem from the Polymarket portfolio or a deposit-wallet relayer flow.",
+                    }
+
                 print("   ℹ️ Position already redeemed or no longer held on-chain")
                 return {
                     "success": True,
@@ -3026,6 +3173,7 @@ class PolymarketClient:
             token_id = pos.get("token_id")
             shares = pos.get("size", 0)
             cur_price = pos.get("current_price", 0)
+            redeemable = pos.get("redeemable")
             title = pos.get("title", "Unknown")[:40]
             
             if not token_id or shares <= 0:
@@ -3047,6 +3195,11 @@ class PolymarketClient:
                 unresolved_positions += 1
                 if config.VERBOSE_LOGGING:
                     print(f"   ⏳ PENDING: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - not resolved")
+                continue
+            elif redeemable is False:
+                unresolved_positions += 1
+                if config.VERBOSE_LOGGING:
+                    print(f"   ⏳ NOT REDEEMABLE: {title}... ({shares:.2f} shares @ ${cur_price:.2f})")
                 continue
             
             # ════════════════════════════════════════════════════════════════

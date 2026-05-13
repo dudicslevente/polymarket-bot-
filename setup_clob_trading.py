@@ -136,6 +136,13 @@ def set_allowances(dry_run=False):
     
     priv_key = os.getenv('WALLET_PRIVATE_KEY')
     pub_key = os.getenv('WALLET_ADDRESS')
+    funder = (
+        os.getenv('POLYMARKET_FUNDER_ADDRESS')
+        or os.getenv('POLYMARKET_DEPOSIT_WALLET_ADDRESS')
+        or os.getenv('DEPOSIT_WALLET_ADDRESS')
+        or pub_key
+    )
+    signature_type = int(os.getenv('POLYMARKET_SIGNATURE_TYPE', '0'))
     chain_id = 137
     
     if not priv_key or not pub_key:
@@ -152,8 +159,18 @@ def set_allowances(dry_run=False):
         return False
     
     pub_key = web3.to_checksum_address(pub_key)
+    funder = web3.to_checksum_address(funder) if funder else pub_key
     print(f"Wallet Address: {pub_key}")
+    if funder != pub_key:
+        print(f"Funder Address: {funder}")
     print()
+
+    if funder != pub_key or signature_type == 3:
+        print("⚠️  This direct approval helper only works when the signer wallet owns the funds.")
+        print("   Your configuration uses a funder/deposit wallet, so approvals must be made")
+        print("   from that wallet via Polymarket's deposit-wallet/relayer flow or website.")
+        print("   The bot will still use this funder for CLOB trading once it is approved.")
+        return False
     
     # Check balances
     balances = get_balances(web3, pub_key)
@@ -197,6 +214,8 @@ def set_allowances(dry_run=False):
     import time
     success_count = 0
     nonce = web3.eth.get_transaction_count(pub_key)
+    max_int = int(MAX_INT, 0) if isinstance(MAX_INT, str) else int(MAX_INT)
+    sufficient_allowance = max_int // 2
     
     for i, (exchange_addr, exchange_name) in enumerate(EXCHANGES):
         print(f"📋 {exchange_name}:")
@@ -205,12 +224,12 @@ def set_allowances(dry_run=False):
         # pUSD approve
         try:
             pusd_allowance = pusd.functions.allowance(pub_key, exchange_checksum).call()
-            if pusd_allowance > 0:
+            if pusd_allowance >= sufficient_allowance:
                 print("  ✅ pUSD approve - Already approved")
                 success_count += 1
             else:
                 raw_tx = pusd.functions.approve(
-                    exchange_checksum, int(MAX_INT, 0)
+                    exchange_checksum, max_int
                 ).build_transaction({
                     "chainId": chain_id,
                     "from": pub_key,
@@ -407,14 +426,20 @@ def check_clob_status():
         api_passphrase = os.getenv('POLYMARKET_PASSPHRASE')
 
         def load_creds(force_derive=False):
-            if not force_derive and api_key and api_secret and api_passphrase:
-                client.set_api_creds(ApiCreds(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    api_passphrase=api_passphrase,
-                ))
-            else:
-                client.set_api_creds(client.create_or_derive_api_key())
+            if force_derive:
+                client.set_api_creds(client.derive_api_key())
+                return
+            try:
+                client.set_api_creds(client.derive_api_key())
+            except Exception:
+                if api_key and api_secret and api_passphrase:
+                    client.set_api_creds(ApiCreds(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        api_passphrase=api_passphrase,
+                    ))
+                else:
+                    raise
 
         load_creds(force_derive=False)
         
@@ -462,7 +487,7 @@ def check_clob_status():
                 raise
         
         balance = int(result.get('balance', 0)) / 1_000_000
-        print(f"CLOB Balance: ${balance:.2f} USDC")
+        print(f"CLOB Balance: ${balance:.2f} pUSD")
         print()
         
         print("Allowances:")
@@ -474,11 +499,15 @@ def check_clob_status():
         }
         
         all_approved = True
-        for addr, amount in allowances.items():
-            name = exchange_names.get(addr.lower(), addr[:20] + "...")
-            approved = int(amount) > 0
+        normalized_allowances = {
+            addr.lower(): int(amount)
+            for addr, amount in allowances.items()
+        }
+        for expected_addr, expected_name in EXCHANGES:
+            amount = normalized_allowances.get(expected_addr.lower(), 0)
+            approved = amount > 0
             status = "✅ Approved" if approved else "❌ Not approved"
-            print(f"  {name}: {status}")
+            print(f"  {expected_name}: {status}")
             if not approved:
                 all_approved = False
         

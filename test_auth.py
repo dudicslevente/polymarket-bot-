@@ -114,12 +114,18 @@ def test_live_mode_with_credentials():
     is_valid, errors = auth.validate_credentials()
     assert is_valid, f"Credentials should be valid (errors: {errors})"
     
-    # Headers should include auth info
+    # L1 headers should include signer auth info
     headers = auth.get_l1_headers("GET", "/balance")
-    assert "POLY-API-KEY" in headers, "Headers should include API key"
-    assert "POLY-SIGNATURE" in headers, "Headers should include signature"
-    assert "POLY-TIMESTAMP" in headers, "Headers should include timestamp"
-    assert headers["POLY-API-KEY"] == "test_api_key_12345", "API key should match"
+    assert "POLY_ADDRESS" in headers, "L1 headers should include signer address"
+    assert "POLY_SIGNATURE" in headers, "L1 headers should include signature"
+    assert "POLY_TIMESTAMP" in headers, "L1 headers should include timestamp"
+
+    # L2 headers should include API credential auth info
+    headers = auth.get_l2_headers("GET", "/balance")
+    assert "POLY_API_KEY" in headers, "L2 headers should include API key"
+    assert "POLY_SIGNATURE" in headers, "L2 headers should include signature"
+    assert "POLY_TIMESTAMP" in headers, "L2 headers should include timestamp"
+    assert headers["POLY_API_KEY"] == "test_api_key_12345", "API key should match"
     
     # Wallet should be verified
     assert auth.verify_wallet_connection(), "Wallet should be verified"

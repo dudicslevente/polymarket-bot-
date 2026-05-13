@@ -2,8 +2,10 @@
 """
 Enable CLOB Trading on Polymarket
 
-This script helps you enable CLOB (API) trading by approving USDC for the exchange.
-Run this if your CLOB balance shows $0 but you have funds in your wallet.
+Compatibility helper for CLOB setup checks.
+
+Polymarket now uses pUSD as CLOB trading collateral. For wrapping and actual
+allowance transactions, use setup_clob_trading.py.
 """
 
 import os
@@ -42,7 +44,7 @@ def main():
     )
     
     # Get API credentials
-    creds = client.create_or_derive_api_key()
+    creds = client.derive_api_key()
     client.set_api_creds(creds)
     
     print(f"Wallet Address: {client.get_address()}")
@@ -61,13 +63,13 @@ def main():
         except Exception:
             pass
         result = client.get_balance_allowance(params)
-        print(f"Current CLOB Balance: ${int(result.get('balance', 0)) / 1_000_000:.2f} USDC")
+        print(f"Current CLOB Balance: ${int(result.get('balance', 0)) / 1_000_000:.2f} pUSD")
         print(f"Signature Type: {signature_type}")
         print(f"Funder: {funder or 'N/A'}")
         
         allowances = result.get('allowances', {})
         has_allowance = any(int(v) > 0 for v in allowances.values())
-        print(f"USDC Approved for Trading: {'Yes' if has_allowance else 'No'}")
+        print(f"pUSD Approved for Trading: {'Yes' if has_allowance else 'No'}")
         print()
         
         if not has_allowance:
@@ -75,7 +77,7 @@ def main():
             print("NEXT STEPS:")
             print("=" * 50)
             print()
-            print("Your wallet needs USDC approved for CLOB trading.")
+            print("Your wallet needs pUSD/CTF approvals for CLOB trading.")
             print()
             print("Option 1 - Via Polymarket Website (EASIEST):")
             print("  1. Go to https://polymarket.com")
@@ -86,20 +88,20 @@ def main():
             print("Option 2 - Transfer funds from Polymarket to CLOB:")
             print("  1. On Polymarket website, go to Wallet")
             print("  2. Look for 'Transfer to API' or similar")
-            print("  3. Transfer your USDC into the CLOB wallet/funder")
+            print("  3. Transfer pUSD into the CLOB wallet/funder")
             print()
-            print("Option 3 - Direct Polygon USDC deposit:")
-            print("  1. Send USDC on Polygon network to your wallet")
-            print("  2. The bot will detect and use it")
+            print("Option 3 - Direct Polygon setup:")
+            print("  1. Hold pUSD in your configured funder wallet")
+            print("  2. Run: python3 setup_clob_trading.py approve")
         else:
             print("=" * 50)
             print("STATUS: Ready to trade!")
             print("=" * 50)
             if int(result.get('balance', 0)) == 0:
                 print()
-                print("NOTE: You have USDC approved but $0 balance.")
+                print("NOTE: You have approvals but $0 pUSD CLOB balance.")
                 print("Transfer funds into the Polymarket CLOB wallet/funder or")
-                print("deposit USDC to the correct Polygon wallet.")
+                print("wrap legacy USDC.e with: python3 setup_clob_trading.py wrap all")
                 
     except Exception as e:
         print(f"Error checking balance: {e}")

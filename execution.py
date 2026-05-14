@@ -734,16 +734,29 @@ class ExecutionEngine:
         
         if config.VERBOSE_LOGGING:
             print(f"📋 Order placed: {order_id}")
-            print(f"   Waiting for fill confirmation...")
-        
-        # Wait for order to be filled
-        # Pass token_id for fallback position checking if order status returns 404
-        fill_result = self.polymarket.wait_for_order_fill(
-            order_id=order_id,
-            max_wait_seconds=config.ORDER_FILL_TIMEOUT if hasattr(config, 'ORDER_FILL_TIMEOUT') else 60,
-            poll_interval=2.0,
-            token_id=trade.token_id
-        )
+            if result.get("filled_shares"):
+                print(f"   Fill already confirmed during order submission recovery")
+            else:
+                print(f"   Waiting for fill confirmation...")
+
+        if result.get("filled_shares"):
+            fill_result = {
+                "success": True,
+                "status": result.get("status", "FILLED"),
+                "filled_price": result.get("filled_price") or result.get("price", 0.0),
+                "filled_shares": result.get("filled_shares") or result.get("shares", 0.0),
+                "order_id": order_id,
+                "error": None,
+            }
+        else:
+            # Wait for order to be filled
+            # Pass token_id for fallback position checking if order status returns 404
+            fill_result = self.polymarket.wait_for_order_fill(
+                order_id=order_id,
+                max_wait_seconds=config.ORDER_FILL_TIMEOUT if hasattr(config, 'ORDER_FILL_TIMEOUT') else 60,
+                poll_interval=2.0,
+                token_id=trade.token_id
+            )
         
         if not fill_result["success"]:
             # Order was not filled - handle failure

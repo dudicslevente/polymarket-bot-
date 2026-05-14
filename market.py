@@ -1114,23 +1114,36 @@ class PolymarketClient:
             # Create and sign the order
             signed_order = clob_client.create_market_order(order_args, options)
             
-            # Post the order to the CLOB with retry logic for network timeouts
-            result = None
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    result = clob_client.post_order(signed_order, order_type=OrderType.FOK)
-                    break  # Success, exit retry loop
-                except Exception as retry_error:
-                    error_str = str(retry_error).lower()
-                    is_timeout = "timeout" in error_str or "readtimeout" in error_str or "request exception" in error_str
-                    
-                    if is_timeout and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
-                        print(f"⚠️ Order submission timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                    else:
-                        raise  # Re-raise if not a timeout or last attempt
+            # Post the order to the CLOB. If the HTTP read times out, do not
+            # re-submit the same signed order: the server may already have
+            # accepted it, and the second POST will be rejected as a duplicate.
+            try:
+                result = clob_client.post_order(signed_order, order_type=OrderType.FOK)
+            except Exception as retry_error:
+                error_str = str(retry_error).lower()
+                is_timeout = (
+                    "timeout" in error_str
+                    or "readtimeout" in error_str
+                    or "request exception" in error_str
+                )
+                if not is_timeout:
+                    raise
+
+                print("⚠️ Order submission timed out after sending to CLOB.")
+                print("   Not re-submitting the same signed order; checking for a fill instead...")
+                recovered = self._recover_timed_out_order_fill(token_id, order_price, amount_usd)
+                if recovered:
+                    self.mark_as_traded(market)
+                    return recovered
+
+                return {
+                    "success": False,
+                    "error": "Order submission timed out; no fill detected via positions/trades",
+                    "status": "SUBMISSION_TIMEOUT",
+                    "amount_usd": amount_usd,
+                    "price": order_price,
+                    "shares": 0,
+                }
             
             if config.VERBOSE_LOGGING:
                 print(f"📥 Order response: {result}")
@@ -1403,6 +1416,49 @@ class PolymarketClient:
             result["error"] = f"Error parsing response: {e}"
         
         return result
+
+    def _recover_timed_out_order_fill(
+        self,
+        token_id: str,
+        fallback_price: float,
+        amount_usd: float,
+    ) -> Optional[Dict]:
+        """Recover a market-order fill after the POST request timed out."""
+        position = self._check_position_for_fill(token_id, retries=5, delay_seconds=2.0)
+        if position:
+            filled_shares = float(position.get("size") or 0)
+            filled_price = float(position.get("avg_price") or fallback_price or 0)
+            print("✅ Timed-out order appears filled via position data")
+            return {
+                "success": True,
+                "order_id": f"timeout-position-{token_id[:12]}",
+                "status": "FILLED_VIA_POSITION",
+                "amount_usd": amount_usd,
+                "price": filled_price,
+                "shares": filled_shares,
+                "filled_price": filled_price,
+                "filled_shares": filled_shares,
+                "raw_response": {"recovered_after_timeout": True, "source": "position"},
+            }
+
+        trade = self._check_trades_for_fill(token_id)
+        if trade:
+            filled_shares = float(trade.get("size") or 0)
+            filled_price = float(trade.get("price") or fallback_price or 0)
+            print("✅ Timed-out order appears filled via trade history")
+            return {
+                "success": True,
+                "order_id": f"timeout-trade-{token_id[:12]}",
+                "status": "FILLED_VIA_TRADES",
+                "amount_usd": amount_usd,
+                "price": filled_price,
+                "shares": filled_shares,
+                "filled_price": filled_price,
+                "filled_shares": filled_shares,
+                "raw_response": {"recovered_after_timeout": True, "source": "trades"},
+            }
+
+        return None
 
     def cancel_order(self, order_id: str) -> bool:
         """
@@ -3009,7 +3065,7 @@ class PolymarketClient:
                         print(f"      Burned: {shares_burned:.4f} shares")
                         print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
 
-                        return {
+                        result = {
                             "success": True,
                             "amount_usdc": shares_burned,
                             "shares_redeemed": shares_burned,
@@ -3019,6 +3075,19 @@ class PolymarketClient:
                             "tx_hash": tx_hash_hex,
                             "gas_used": receipt['gasUsed']
                         }
+                        # Some legacy/adapter-backed redemptions credit USDC.e even
+                        # when the CLOB displays pUSD buying power. Wrap whatever
+                        # USDC.e is present after any successful redeem.
+                        wrap_result = self._wrap_legacy_usdce_to_pusd(
+                            web3,
+                            wallet_address,
+                            private_key,
+                            USDCE_ADDRESS,
+                        )
+                        if wrap_result:
+                            result.update(wrap_result)
+
+                        return result
 
                     print(f"   ❌ Transaction failed (reverted)")
                     last_error = "transaction reverted"
@@ -3036,6 +3105,147 @@ class PolymarketClient:
         except Exception as e:
             print(f"❌ On-chain redemption error: {e}")
             return None
+
+    def _wrap_legacy_usdce_to_pusd(
+        self,
+        web3,
+        wallet_address: str,
+        private_key: str,
+        usdce_address: str,
+    ) -> Optional[Dict]:
+        """Wrap any legacy USDC.e balance into pUSD after an old collateral redeem."""
+        try:
+            from web3.constants import MAX_INT
+
+            collateral_onramp_address = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+            erc20_abi = [
+                {
+                    "constant": True,
+                    "inputs": [{"name": "_owner", "type": "address"}],
+                    "name": "balanceOf",
+                    "outputs": [{"name": "balance", "type": "uint256"}],
+                    "type": "function",
+                },
+                {
+                    "constant": True,
+                    "inputs": [
+                        {"name": "_owner", "type": "address"},
+                        {"name": "_spender", "type": "address"},
+                    ],
+                    "name": "allowance",
+                    "outputs": [{"name": "remaining", "type": "uint256"}],
+                    "type": "function",
+                },
+                {
+                    "constant": False,
+                    "inputs": [
+                        {"name": "_spender", "type": "address"},
+                        {"name": "_value", "type": "uint256"},
+                    ],
+                    "name": "approve",
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "nonpayable",
+                    "type": "function",
+                },
+            ]
+            onramp_abi = [
+                {
+                    "inputs": [
+                        {"internalType": "address", "name": "_asset", "type": "address"},
+                        {"internalType": "address", "name": "_to", "type": "address"},
+                        {"internalType": "uint256", "name": "_amount", "type": "uint256"},
+                    ],
+                    "name": "wrap",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function",
+                }
+            ]
+
+            usdce = web3.eth.contract(
+                address=web3.to_checksum_address(usdce_address),
+                abi=erc20_abi,
+            )
+            onramp_checksum = web3.to_checksum_address(collateral_onramp_address)
+            onramp = web3.eth.contract(address=onramp_checksum, abi=onramp_abi)
+
+            amount_units = usdce.functions.balanceOf(wallet_address).call()
+            if amount_units <= 0:
+                return None
+
+            amount = amount_units / 1_000_000
+            print(f"   🔁 Wrapping redeemed legacy USDC.e into pUSD: ${amount:.6f}")
+
+            nonce = web3.eth.get_transaction_count(wallet_address)
+            allowance = usdce.functions.allowance(wallet_address, onramp_checksum).call()
+            tx_hashes = []
+            max_int = int(MAX_INT, 0) if isinstance(MAX_INT, str) else int(MAX_INT)
+
+            if allowance < amount_units:
+                approve_tx = usdce.functions.approve(
+                    onramp_checksum,
+                    max_int,
+                ).build_transaction({
+                    "chainId": 137,
+                    "from": wallet_address,
+                    "nonce": nonce,
+                    "gasPrice": web3.eth.gas_price,
+                })
+                approve_tx["gas"] = int(web3.eth.estimate_gas(approve_tx) * 1.2)
+                signed_approve = web3.eth.account.sign_transaction(approve_tx, private_key)
+                approve_hash = web3.eth.send_raw_transaction(signed_approve.raw_transaction)
+                approve_hash_hex = approve_hash.hex()
+                tx_hashes.append(approve_hash_hex)
+                print(f"      Approval sent: {approve_hash_hex}")
+                approve_receipt = web3.eth.wait_for_transaction_receipt(approve_hash, timeout=180)
+                if approve_receipt["status"] != 1:
+                    print("      ⚠️ USDC.e approval for wrapping failed")
+                    return {
+                        "wrapped_to_pusd": False,
+                        "wrap_error": "USDC.e approval failed",
+                        "wrap_tx_hashes": tx_hashes,
+                    }
+                nonce += 1
+
+            wrap_tx = onramp.functions.wrap(
+                web3.to_checksum_address(usdce_address),
+                wallet_address,
+                amount_units,
+            ).build_transaction({
+                "chainId": 137,
+                "from": wallet_address,
+                "nonce": nonce,
+                "gasPrice": web3.eth.gas_price,
+            })
+            wrap_tx["gas"] = int(web3.eth.estimate_gas(wrap_tx) * 1.2)
+            signed_wrap = web3.eth.account.sign_transaction(wrap_tx, private_key)
+            wrap_hash = web3.eth.send_raw_transaction(signed_wrap.raw_transaction)
+            wrap_hash_hex = wrap_hash.hex()
+            tx_hashes.append(wrap_hash_hex)
+            print(f"      Wrap sent: {wrap_hash_hex}")
+            wrap_receipt = web3.eth.wait_for_transaction_receipt(wrap_hash, timeout=180)
+
+            if wrap_receipt["status"] == 1:
+                print(f"   ✅ Wrapped ${amount:.6f} USDC.e into pUSD")
+                return {
+                    "wrapped_to_pusd": True,
+                    "wrapped_amount": amount,
+                    "wrap_tx_hash": wrap_hash_hex,
+                    "wrap_tx_hashes": tx_hashes,
+                }
+
+            print("      ⚠️ USDC.e → pUSD wrap transaction failed")
+            return {
+                "wrapped_to_pusd": False,
+                "wrap_error": "wrap transaction failed",
+                "wrap_tx_hashes": tx_hashes,
+            }
+        except Exception as e:
+            print(f"      ⚠️ Could not auto-wrap redeemed USDC.e into pUSD: {e}")
+            return {
+                "wrapped_to_pusd": False,
+                "wrap_error": str(e),
+            }
     
     def _execute_redemption(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
         """
@@ -3221,7 +3431,10 @@ class PolymarketClient:
                     total_redeemed += amount
                     print(f"      ✅ Redeemed ${amount:.2f} on-chain")
                     if result.get("collateral") == "legacy USDC.e":
-                        print("      ℹ️ Redeemed into USDC.e. Run 'python3 setup_clob_trading.py wrap all' to convert it to pUSD CLOB balance.")
+                        if result.get("wrapped_to_pusd"):
+                            print(f"      ✅ Auto-wrapped ${result.get('wrapped_amount', amount):.2f} USDC.e into pUSD")
+                        else:
+                            print("      ℹ️ Redeemed into USDC.e. Run 'python3 setup_clob_trading.py wrap all' to convert it to pUSD CLOB balance.")
                 elif result.get("method") == "already_redeemed":
                     already_redeemed += 1
                     print(f"      ✅ Already redeemed")

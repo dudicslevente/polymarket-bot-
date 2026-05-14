@@ -397,11 +397,12 @@ Keep POL in the wallet for on-chain setup and maintenance actions:
 
 | Action | Approx Cost |
 |--------|-------------|
-| Wrap USDC.e into pUSD | Small Polygon gas fee |
+| Wrap USDC.e into pUSD | Usually ~0.03-0.06 POL |
+| First-time USDC.e onramp approval + wrap | Usually ~0.05-0.09 POL |
 | Approve pUSD/CTF contracts | Small Polygon gas fee |
 | Claim/redeem on-chain positions | Small Polygon gas fee |
 
-Live CLOB orders are signed through the API, but setup and redemption flows still need POL. With **0.5 POL**, you should have plenty for setup and maintenance. Polygon gas is very cheap.
+Live CLOB orders are signed through the API, but setup, redemption, and USDC.e→pUSD wrapping flows still need POL. Gas prices move, but with **0.5 POL** you should usually have plenty for setup and maintenance. Keeping more POL, such as 1+ POL, gives extra room during high-gas periods.
 
 ### Step 6: Start Live Trading
 
@@ -886,7 +887,7 @@ from market import get_client
 client = get_client()
 
 # Balance & Positions
-client.get_usdc_balance()          # Get wallet USDC balance
+client.get_usdc_balance()          # Get pUSD CLOB balance
 client.get_open_positions()        # Get all open positions
 client.get_position_for_token(id)  # Get specific position
 
@@ -898,7 +899,7 @@ client.cancel_order(order_id)      # Cancel unfilled order
 # Resolution & Redemption
 client.get_market_resolution(...)  # Check if market resolved
 client.check_trade_resolution(...) # Check WIN/LOSS
-client.redeem_winning_shares(...)  # Convert shares to USDC ⭐
+client.redeem_winning_shares(...)  # Redeem winning shares; auto-wrap USDC.e if needed ⭐
 client.redeem_all_winning_positions()  # Batch redemption ⭐
 ```
 
@@ -1001,13 +1002,19 @@ print(f"Trading paused: {stats['trading_paused']}")
 
 ### Understanding Polymarket's Payout System
 
-When you win a trade on Polymarket, your winnings are **NOT automatically credited** to your USDC balance. Instead:
+When you win a trade on Polymarket, your winnings are **NOT automatically credited** to your pUSD CLOB balance. Instead:
 
 1. You receive **winning shares** (tokens)
-2. These shares must be **redeemed** to convert back to USDC
+2. These shares must be **redeemed** to unlock the payout collateral
 3. Without redemption, your winnings stay locked as tokens!
 
 **This bot handles redemption automatically.** Here's how:
+
+#### Why winnings can appear as USDC.e
+
+Polymarket's current CLOB balance layer uses **pUSD**, but some resolved CTF positions still settle through legacy/adapter collateral paths. That means a trade can be opened using pUSD buying power and still redeem into **USDC.e** on-chain. The bot cannot force the `redeemPositions` contract to return a different collateral token.
+
+To handle this, after every successful redemption the bot checks the wallet for **USDC.e** and automatically wraps it into **pUSD** through Polymarket's `CollateralOnramp`. If the USDC.e onramp approval already exists, this is usually one extra Polygon transaction. At recent observed gas prices, this has typically been around **0.03-0.06 POL**; if approval is needed too, expect roughly **0.05-0.09 POL**.
 
 ### How Automatic Redemption Works
 
@@ -1031,7 +1038,8 @@ When you win a trade on Polymarket, your winnings are **NOT automatically credit
 │                                                                  │
 │  4. IF WIN: AUTOMATIC REDEMPTION                                 │
 │     ├─> Call redeem_winning_shares(token_id)                     │
-│     ├─> Convert winning shares → USDC                            │
+│     ├─> Burn winning shares and redeem payout collateral          │
+│     ├─> If payout is USDC.e, auto-wrap USDC.e → pUSD             │
 │     ├─> Update redemption_status = "REDEEMED"                    │
 │     ├─> Record redemption_amount in trade log                    │
 │     └─> Sync balance from API to confirm credit                  │
@@ -1077,7 +1085,7 @@ if outcome == "WIN" and not config.TEST_MODE:
 After redemption, the bot syncs with Polymarket:
 
 ```python
-# Ensures internal balance matches actual USDC:
+# Ensures internal balance matches actual pUSD CLOB balance:
 self._sync_balance_after_resolution()
 ```
 
@@ -1100,7 +1108,7 @@ All trades now log additional fields for live deployment:
 | `token_id` | Token purchased | `21742633...` |
 | `condition_id` | Market condition | `0x8f3e...` |
 | `redemption_status` | Redemption state | `REDEEMED`, `PENDING`, `N/A`, `FAILED` |
-| `redemption_amount` | USDC redeemed | `12.50` |
+| `redemption_amount` | Redeemed payout amount | `12.50` |
 | `order_id` | Polymarket order ID | `abc123...` |
 | `filled_price` | Actual fill price | `0.4825` |
 | `filled_shares` | Shares purchased | `20.7254` |
@@ -1148,7 +1156,7 @@ tail -5 trades.csv | cut -d',' -f1,13,20,21,22
 
 Also verify on Polymarket:
 1. Log into [polymarket.com](https://polymarket.com)
-2. Check your USDC balance
+2. Check your pUSD/CLOB balance
 3. Confirm it increased after the winning trade
 
 ### Troubleshooting Redemption Issues
@@ -1439,6 +1447,8 @@ To use your website balance, withdraw it to your wallet first.
 
 pUSD is Polymarket USD, the current wrapped collateral token used for CLOB trading. USDC.e is older bridged USDC on Polygon. If your wallet has USDC.e, the bot can detect it, but the CLOB API will still show `$0.00` until you wrap it into pUSD.
 
+Winning positions can still occasionally redeem into USDC.e because the on-chain CTF position determines the payout collateral. The bot automatically wraps any USDC.e found after redemption back into pUSD so the CLOB balance is usable for future trades.
+
 ### How do I get pUSD?
 
 1. **Wrap USDC.e already in your bot wallet:** `python setup_clob_trading.py wrap all`
@@ -1447,7 +1457,7 @@ pUSD is Polymarket USD, the current wrapped collateral token used for CLOB tradi
 
 ### Does every trade cost gas (POL)?
 
-Not in the same way as a normal on-chain swap. CLOB orders are signed and submitted through Polymarket's API, while setup actions such as wrapping USDC.e into pUSD, approving contracts, and some redemption/claim flows are on-chain and need POL. Keep a small POL balance for those actions.
+Not in the same way as a normal on-chain swap. CLOB orders are signed and submitted through Polymarket's API, while setup actions such as wrapping USDC.e into pUSD, approving contracts, and some redemption/claim flows are on-chain and need POL. Keep a small POL balance for those actions. A typical USDC.e→pUSD wrap is often around `0.03-0.06 POL`; first-time approval plus wrap can be closer to `0.05-0.09 POL`, depending on Polygon gas.
 
 ---
 
@@ -1486,7 +1496,7 @@ All trades are logged to `trades.csv` with:
 | `token_id` | Token ID (needed for redemption) |
 | `condition_id` | Market condition ID |
 | `redemption_status` | REDEEMED, PENDING, FAILED, or N/A |
-| `redemption_amount` | USDC amount redeemed |
+| `redemption_amount` | Redeemed payout amount |
 
 ### Example CSV Row
 

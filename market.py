@@ -22,10 +22,9 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
-from decimal import Decimal, ROUND_CEILING
 
 import config
-from auth import get_auth, reset_auth, AuthLevel, AuthError
+from auth import get_auth, AuthLevel, AuthError
 
 
 @dataclass
@@ -68,9 +67,112 @@ class PolymarketClient:
         
         # Auth module for authenticated requests
         self._auth = get_auth()
-        self._detected_signature_type: Optional[int] = None
-        self._last_signature_type_probe: float = 0.0
-        self._last_collateral_hint: float = 0.0
+
+    def _import_clob_sdk(self):
+        """Import the installed Polymarket CLOB SDK, supporting both package names."""
+        try:
+            from py_clob_client_v2 import (
+                ApiCreds,
+                AssetType,
+                BalanceAllowanceParams,
+                ClobClient,
+                OrderArgs,
+                OrderType,
+                PartialCreateOrderOptions,
+            )
+            from py_clob_client_v2.constants import POLYGON
+        except ImportError:
+            from py_clob_client import (
+                ApiCreds,
+                AssetType,
+                BalanceAllowanceParams,
+                ClobClient,
+                OrderArgs,
+                OrderType,
+            )
+            PartialCreateOrderOptions = None
+            from py_clob_client.constants import POLYGON
+
+        return {
+            "ApiCreds": ApiCreds,
+            "AssetType": AssetType,
+            "BalanceAllowanceParams": BalanceAllowanceParams,
+            "ClobClient": ClobClient,
+            "OrderArgs": OrderArgs,
+            "OrderType": OrderType,
+            "PartialCreateOrderOptions": PartialCreateOrderOptions,
+            "POLYGON": POLYGON,
+        }
+
+    def _get_api_creds(self, sdk: Dict):
+        """Return SDK API credentials from the auth module's freshest values."""
+        credentials = self._auth.credentials
+        if not credentials or not credentials.is_valid_for_l1():
+            raise AuthError("L2 authentication credentials not configured")
+
+        return sdk["ApiCreds"](
+            api_key=credentials.api_key,
+            api_secret=credentials.api_secret,
+            api_passphrase=credentials.passphrase,
+        )
+
+    def _build_clob_client(self, sdk: Optional[Dict] = None, creds=None):
+        """Build an authenticated official CLOB client for live trading calls."""
+        sdk = sdk or self._import_clob_sdk()
+        if creds is None:
+            creds = self._get_api_creds(sdk)
+
+        return sdk["ClobClient"](
+            host=self.clob_url,
+            key=config.WALLET_PRIVATE_KEY,
+            chain_id=sdk["POLYGON"],
+            creds=creds,
+            signature_type=config.POLYMARKET_SIGNATURE_TYPE,
+            funder=config.POLYMARKET_FUNDER_ADDRESS,
+        )
+
+    def _derive_fresh_api_creds(self, sdk: Optional[Dict] = None):
+        """Derive API credentials from the configured private key and cache them."""
+        sdk = sdk or self._import_clob_sdk()
+        client = sdk["ClobClient"](
+            host=self.clob_url,
+            key=config.WALLET_PRIVATE_KEY,
+            chain_id=sdk["POLYGON"],
+            signature_type=config.POLYMARKET_SIGNATURE_TYPE,
+            funder=config.POLYMARKET_FUNDER_ADDRESS,
+        )
+
+        try:
+            derived = client.derive_api_key()
+        except Exception:
+            create_or_derive = getattr(client, "create_or_derive_api_key", None)
+            if create_or_derive is None:
+                raise
+            derived = create_or_derive()
+
+        if self._auth.credentials:
+            self._auth.credentials.api_key = derived.api_key
+            self._auth.credentials.api_secret = derived.api_secret
+            self._auth.credentials.passphrase = derived.api_passphrase
+
+        return sdk["ApiCreds"](
+            api_key=derived.api_key,
+            api_secret=derived.api_secret,
+            api_passphrase=derived.api_passphrase,
+        )
+
+    @staticmethod
+    def _is_unauthorized_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return "401" in text or "unauthorized" in text
+
+    @staticmethod
+    def _post_order_compat(clob_client, signed_order, order_type):
+        """Call post_order with correct API for v2 SDK (positional) or v1 SDK (keyword)."""
+        try:
+            return clob_client.post_order(signed_order, order_type, post_only=False)
+        except TypeError:
+            return clob_client.post_order(signed_order, orderType=order_type, post_only=False)
     
     def _rate_limit_check(self):
         """
@@ -115,7 +217,6 @@ class PolymarketClient:
         Returns None on error (never crashes).
         """
         last_error = None
-        auth_refreshed = False
         
         for attempt in range(retries + 1):
             self._rate_limit_check()
@@ -170,14 +271,6 @@ class PolymarketClient:
                 if response.status_code == 404:
                     print(f"⚠️ HTTP error 404: {e}")
                     return {"_error": "not_found", "_status_code": 404}
-                if response.status_code == 401 and authenticated and not auth_refreshed:
-                    if config.VERBOSE_LOGGING:
-                        print("⚠️ API auth rejected; refreshing Polymarket credentials and retrying...")
-                    reset_auth()
-                    self._auth = get_auth()
-                    auth_refreshed = True
-                    time.sleep(1)
-                    continue
                 if config.VERBOSE_LOGGING:
                     print(f"⚠️ HTTP error {response.status_code}: {e}")
                 return None
@@ -1010,6 +1103,10 @@ class PolymarketClient:
             print(f"❌ Order amount ${amount_usd:.2f} below minimum ${config.MIN_BET_SIZE_USD:.2f}")
             return None
         
+        # Verify we have sufficient balance
+        if not self.verify_sufficient_balance(amount_usd):
+            return None
+        
         # Get current market prices
         prices = self.get_best_prices(market, side_normalized)
         if not prices:
@@ -1074,22 +1171,16 @@ class PolymarketClient:
         if shares <= 0:
             print(f"❌ Invalid share calculation: {shares}")
             return None
-
-        # Verify after any minimum-size adjustment so we check the real spend.
-        if not self.verify_sufficient_balance(amount_usd):
-            return None
         
         # ─────────────────────────────────────────────────────────────────────
         # USE OFFICIAL py-clob-client FOR ORDER CREATION AND SUBMISSION
         # ─────────────────────────────────────────────────────────────────────
         try:
-            from py_clob_client_v2 import MarketOrderArgs, OrderType
-
-            # Initialize the official CLOB client with the same signature type
-            # that was used for the live balance check.
-            clob_client = self._build_clob_client()
-            options = self._get_create_order_options(clob_client, token_id)
-            order_price = self._round_buy_price_to_tick(order_price, options.tick_size or "0.01")
+            sdk = self._import_clob_sdk()
+            clob_client = self._build_clob_client(sdk)
+            OrderArgs = sdk["OrderArgs"]
+            OrderType = sdk["OrderType"]
+            PartialCreateOrderOptions = sdk["PartialCreateOrderOptions"]
             
             # Log order details before submission
             if config.VERBOSE_LOGGING:
@@ -1099,67 +1190,55 @@ class PolymarketClient:
                 print(f"   Amount: ${amount_usd:.2f}")
                 print(f"   Price: {order_price:.4f}")
                 print(f"   Shares: {shares:.2f}")
-                print(f"   Tick size: {options.tick_size} | negRisk: {options.neg_risk}")
             
-            # Create a marketable FOK buy. For BUY market orders, `amount`
-            # is dollars to spend and `price` is the worst acceptable price.
-            order_args = MarketOrderArgs(
+            # Create the order using the official client
+            # V2 SDK: OrderArgs has extra fields (builder_code, user_usdc_balance)
+            # Pass PartialCreateOrderOptions so the SDK resolves tick_size/neg_risk
+            order_args = OrderArgs(
+                price=order_price,  # SDK handles tick-size rounding internally
+                size=shares,
+                side="BUY",
                 token_id=token_id,
-                amount=round(amount_usd, 2),
-                side="BUY",  # We're always buying the outcome we want
-                price=order_price,
-                order_type=OrderType.FOK,
             )
-            
+
             # Create and sign the order
-            signed_order = clob_client.create_market_order(order_args, options)
-            
-            # Post the order to the CLOB. If the HTTP read times out, do not
-            # re-submit the same signed order: the server may already have
-            # accepted it, and the second POST will be rejected as a duplicate.
-            try:
-                result = clob_client.post_order(signed_order, order_type=OrderType.FOK)
-            except Exception as retry_error:
-                error_str = str(retry_error).lower()
-                is_timeout = (
-                    "timeout" in error_str
-                    or "readtimeout" in error_str
-                    or "request exception" in error_str
+            if PartialCreateOrderOptions is not None:
+                signed_order = clob_client.create_order(
+                    order_args, PartialCreateOrderOptions()
                 )
-                if not is_timeout:
-                    raise
-
-                print("⚠️ Order submission timed out after sending to CLOB.")
-                print("   Not re-submitting the same signed order; checking for a fill instead...")
-                recovered = self._recover_timed_out_order_fill(token_id, order_price, amount_usd)
-                if recovered:
-                    self.mark_as_traded(market)
-                    return recovered
-
-                return {
-                    "success": False,
-                    "error": "Order submission timed out; no fill detected via positions/trades",
-                    "status": "SUBMISSION_TIMEOUT",
-                    "amount_usd": amount_usd,
-                    "price": order_price,
-                    "shares": 0,
-                }
+            else:
+                signed_order = clob_client.create_order(order_args)
+            
+            # Post the order to the CLOB with retry logic for network timeouts
+            result = None
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    result = self._post_order_compat(clob_client, signed_order, OrderType.GTC)
+                    break  # Success, exit retry loop
+                except Exception as retry_error:
+                    error_str = str(retry_error).lower()
+                    is_timeout = "timeout" in error_str or "readtimeout" in error_str or "request exception" in error_str
+                    is_unauthorized = self._is_unauthorized_error(retry_error)
+                    
+                    if is_timeout and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
+                        print(f"⚠️ Order submission timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    elif is_unauthorized and attempt == 0:
+                        print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
+                        fresh_creds = self._derive_fresh_api_creds(sdk)
+                        clob_client = self._build_clob_client(sdk, fresh_creds)
+                    else:
+                        raise  # Re-raise if not a timeout or last attempt
             
             if config.VERBOSE_LOGGING:
                 print(f"📥 Order response: {result}")
             
             # Parse the response
             if result and isinstance(result, dict):
-                if self._order_response_success(result):
+                if result.get("success") or result.get("orderID") or result.get("order_id"):
                     order_id = result.get("orderID") or result.get("order_id") or result.get("id")
-                    if not order_id:
-                        error_msg = "CLOB accepted response did not include an order ID"
-                        print(f"❌ Order placement failed: {error_msg}")
-                        return {
-                            "success": False,
-                            "error": error_msg,
-                            "raw_response": result,
-                        }
                     print(f"✅ Order placed successfully!")
                     print(f"   Order ID: {order_id}")
                     self.mark_as_traded(market)
@@ -1173,7 +1252,7 @@ class PolymarketClient:
                         "raw_response": result,
                     }
                 else:
-                    error_msg = self._order_response_error(result) or str(result)
+                    error_msg = result.get("error") or result.get("message") or str(result)
                     print(f"❌ Order placement failed: {error_msg}")
                     return {
                         "success": False,
@@ -1256,92 +1335,6 @@ class PolymarketClient:
         order_price = min(ask_price * 1.001, 0.99)  # Cap at 0.99
         
         return round(order_price, 4)
-
-    def _get_create_order_options(self, clob_client, token_id: str):
-        """Fetch current market order options used by the v2 order builder."""
-        from py_clob_client_v2 import PartialCreateOrderOptions
-
-        tick_size = "0.01"
-        neg_risk = False
-
-        try:
-            fetched_tick = clob_client.get_tick_size(token_id)
-            if fetched_tick:
-                tick_size = str(fetched_tick)
-        except Exception as e:
-            if config.VERBOSE_LOGGING:
-                print(f"⚠️ Could not fetch tick size for token {token_id[:16]}...: {e}")
-
-        try:
-            neg_risk = bool(clob_client.get_neg_risk(token_id))
-        except Exception as e:
-            if config.VERBOSE_LOGGING:
-                print(f"⚠️ Could not fetch negRisk for token {token_id[:16]}...: {e}")
-
-        return PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
-
-    def _round_buy_price_to_tick(self, price: float, tick_size: str) -> float:
-        """Round a buy worst-price upward to the market tick without crossing 1.0."""
-        tick = Decimal(str(tick_size))
-        value = Decimal(str(price))
-        rounded = (value / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-        max_price = Decimal("1") - tick
-        if rounded > max_price:
-            rounded = max_price
-        if rounded < tick:
-            rounded = tick
-        return float(rounded)
-
-    def _order_response_error(self, response: Dict) -> Optional[str]:
-        """Extract a failure reason from CLOB order responses."""
-        for key in ("error", "errorMsg", "message", "reason"):
-            value = response.get(key)
-            if value:
-                return str(value)
-        return None
-
-    def _order_response_success(self, response: Dict) -> bool:
-        """Return True only when the CLOB response explicitly indicates acceptance."""
-        if not isinstance(response, dict):
-            return False
-
-        success_value = response.get("success")
-        if success_value is False:
-            return False
-        if isinstance(success_value, str) and success_value.lower() == "false":
-            return False
-
-        status = str(
-            response.get("status")
-            or response.get("orderStatus")
-            or response.get("state")
-            or ""
-        ).upper()
-        terminal_failure = {"FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"}
-        if status in terminal_failure:
-            return False
-
-        if success_value is True:
-            return True
-        if isinstance(success_value, str) and success_value.lower() == "true":
-            return True
-
-        order_id = (
-            response.get("orderID")
-            or response.get("order_id")
-            or response.get("id")
-            or response.get("orderId")
-        )
-        accepted_status = {
-            "SUBMITTED",
-            "OPEN",
-            "PENDING",
-            "LIVE",
-            "MATCHED",
-            "FILLED",
-            "PARTIAL",
-        }
-        return bool(order_id and (not status or status in accepted_status))
     
     def _parse_order_response(
         self, 
@@ -1374,10 +1367,13 @@ class PolymarketClient:
         }
         
         try:
-            # Check for explicit failure responses first. Newer CLOB responses can
-            # include an order id alongside success=false/errorMsg.
-            if not self._order_response_success(response):
-                result["error"] = self._order_response_error(response) or str(response)
+            # Check for error responses
+            if "error" in response:
+                result["error"] = response["error"]
+                return result
+            
+            if "message" in response and "error" in response.get("message", "").lower():
+                result["error"] = response["message"]
                 return result
             
             # Extract order ID (various possible field names)
@@ -1397,7 +1393,9 @@ class PolymarketClient:
             )
             result["status"] = status.upper() if isinstance(status, str) else status
             
-            result["success"] = True
+            # Check if order was accepted
+            if order_id or status in ["SUBMITTED", "OPEN", "PENDING", "FILLED", "PARTIAL"]:
+                result["success"] = True
             
             # Extract fill information if available
             if "filledSize" in response:
@@ -1416,49 +1414,6 @@ class PolymarketClient:
             result["error"] = f"Error parsing response: {e}"
         
         return result
-
-    def _recover_timed_out_order_fill(
-        self,
-        token_id: str,
-        fallback_price: float,
-        amount_usd: float,
-    ) -> Optional[Dict]:
-        """Recover a market-order fill after the POST request timed out."""
-        position = self._check_position_for_fill(token_id, retries=5, delay_seconds=2.0)
-        if position:
-            filled_shares = float(position.get("size") or 0)
-            filled_price = float(position.get("avg_price") or fallback_price or 0)
-            print("✅ Timed-out order appears filled via position data")
-            return {
-                "success": True,
-                "order_id": f"timeout-position-{token_id[:12]}",
-                "status": "FILLED_VIA_POSITION",
-                "amount_usd": amount_usd,
-                "price": filled_price,
-                "shares": filled_shares,
-                "filled_price": filled_price,
-                "filled_shares": filled_shares,
-                "raw_response": {"recovered_after_timeout": True, "source": "position"},
-            }
-
-        trade = self._check_trades_for_fill(token_id)
-        if trade:
-            filled_shares = float(trade.get("size") or 0)
-            filled_price = float(trade.get("price") or fallback_price or 0)
-            print("✅ Timed-out order appears filled via trade history")
-            return {
-                "success": True,
-                "order_id": f"timeout-trade-{token_id[:12]}",
-                "status": "FILLED_VIA_TRADES",
-                "amount_usd": amount_usd,
-                "price": filled_price,
-                "shares": filled_shares,
-                "filled_price": filled_price,
-                "filled_shares": filled_shares,
-                "raw_response": {"recovered_after_timeout": True, "source": "trades"},
-            }
-
-        return None
 
     def cancel_order(self, order_id: str) -> bool:
         """
@@ -1870,39 +1825,40 @@ class PolymarketClient:
         """
         try:
             # Use the data-api trades endpoint
+            wallet_address = config.WALLET_ADDRESS
+            if not wallet_address:
+                return None
+            
             data_api_url = "https://data-api.polymarket.com"
             url = f"{data_api_url}/trades"
-
-            for user_address in self._account_addresses_for_data_api():
-                params = {
-                    "user": user_address,
-                    "limit": 20,  # Check last 20 trades
-                }
-                
-                response = requests.get(url, params=params, timeout=30)
-                response.raise_for_status()
-                trades = response.json()
-                
-                if not isinstance(trades, list):
-                    trades = trades.get("trades", []) if isinstance(trades, dict) else []
-                
-                # Look for a recent trade with our token
-                for trade in trades:
-                    trade_token = (
-                        trade.get("asset") or 
-                        trade.get("token_id") or 
-                        trade.get("tokenId") or
-                        ""
-                    )
-                    if trade_token == token_id:
-                        # Found a matching trade!
-                        return {
-                            "token_id": trade_token,
-                            "size": float(trade.get("size") or trade.get("amount") or 0),
-                            "price": float(trade.get("price") or 0),
-                            "timestamp": trade.get("timestamp") or trade.get("createdAt"),
-                            "owner": user_address,
-                        }
+            params = {
+                "user": wallet_address.lower(),
+                "limit": 20,  # Check last 20 trades
+            }
+            
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            trades = response.json()
+            
+            if not isinstance(trades, list):
+                trades = trades.get("trades", []) if isinstance(trades, dict) else []
+            
+            # Look for a recent trade with our token
+            for trade in trades:
+                trade_token = (
+                    trade.get("asset") or 
+                    trade.get("token_id") or 
+                    trade.get("tokenId") or
+                    ""
+                )
+                if trade_token == token_id:
+                    # Found a matching trade!
+                    return {
+                        "token_id": trade_token,
+                        "size": float(trade.get("size") or trade.get("amount") or 0),
+                        "price": float(trade.get("price") or 0),
+                        "timestamp": trade.get("timestamp") or trade.get("createdAt"),
+                    }
             
             return None
             
@@ -2031,232 +1987,15 @@ class PolymarketClient:
     # BALANCE & ACCOUNT METHODS (LIVE MODE)
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    def _effective_signature_type(self) -> int:
-        """Return the signature type currently used for CLOB account calls."""
-        if self._detected_signature_type is not None:
-            return self._detected_signature_type
-        return config.POLYMARKET_SIGNATURE_TYPE
-
-    def _effective_funder_address(self) -> Optional[str]:
-        """Return the address that holds funds for CLOB orders."""
-        return config.POLYMARKET_FUNDER_ADDRESS or config.WALLET_ADDRESS
-
-    def _account_addresses_for_data_api(self) -> List[str]:
-        """
-        Return possible account addresses for Data API lookups.
-
-        Newer Polymarket setups can keep CLOB funds/positions under a funder or
-        deposit wallet while the signer remains WALLET_ADDRESS. Querying both
-        keeps fills and redemptions visible for EOA and migrated accounts.
-        """
-        candidates = [
-            self._effective_funder_address(),
-            config.WALLET_ADDRESS,
-        ]
-        unique = []
-        for address in candidates:
-            if not address:
-                continue
-            normalized = address.lower()
-            if normalized not in unique:
-                unique.append(normalized)
-        return unique
-
-    def _get_api_creds_values(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """
-        Get the freshest API credentials available.
-
-        auth.py may derive fresh credentials at runtime to avoid stale .env keys,
-        so prefer those over the static config values.
-        """
-        creds = getattr(self._auth, "credentials", None)
-        if creds:
-            return creds.api_key, creds.api_secret, creds.passphrase
-        return (
-            config.POLYMARKET_API_KEY,
-            config.POLYMARKET_API_SECRET,
-            config.POLYMARKET_PASSPHRASE,
-        )
-
-    def _signature_types_to_probe(self) -> List[int]:
-        """Probe likely Polymarket account types, keeping the configured value first."""
-        configured = config.POLYMARKET_SIGNATURE_TYPE
-        candidates = [configured, 3, 1, 2, 0]
-        unique = []
-        for value in candidates:
-            if value in (0, 1, 2, 3) and value not in unique:
-                unique.append(value)
-        return unique
-
-    def _build_clob_client(self, signature_type: Optional[int] = None):
-        """
-        Build the official v2 CLOB client for account-sensitive calls.
-
-        Balance/allowance behavior changed to depend heavily on the configured
-        signature type. The SDK keeps that wire format current, so prefer it over
-        hand-built REST calls whenever it is installed.
-        """
-        effective_signature_type = (
-            signature_type if signature_type is not None else self._effective_signature_type()
-        )
-        if (
-            effective_signature_type == 3
-            and not getattr(config, "POLYMARKET_CONFIGURED_FUNDER_ADDRESS", None)
-        ):
-            raise ValueError(
-                "POLYMARKET_FUNDER_ADDRESS or DEPOSIT_WALLET_ADDRESS is required "
-                "when using signature_type=3"
-            )
-
-        from py_clob_client_v2 import ApiCreds, ClobClient
-
-        api_key, api_secret, passphrase = self._get_api_creds_values()
-        creds = ApiCreds(
-            api_key=api_key,
-            api_secret=api_secret,
-            api_passphrase=passphrase,
-        )
-
-        return ClobClient(
-            host=self.clob_url,
-            chain_id=137,
-            key=config.WALLET_PRIVATE_KEY,
-            creds=creds,
-            signature_type=effective_signature_type,
-            funder=self._effective_funder_address(),
-        )
-
-    def _fetch_balance_allowance_via_sdk(self, signature_type: int) -> Optional[Dict]:
-        """Fetch PUSD balance/allowance through py-clob-client-v2."""
-        try:
-            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
-
-            client = self._build_clob_client(signature_type)
-            params = BalanceAllowanceParams(
-                asset_type=AssetType.COLLATERAL,
-                signature_type=signature_type,
-            )
-
-            # The CLOB server caches balances/allowances per signature type.
-            # Updating first prevents a funded account from looking empty after
-            # deposits, withdrawals, approvals, or Polymarket wallet migrations.
-            try:
-                client.update_balance_allowance(params)
-            except Exception as e:
-                if config.VERBOSE_LOGGING:
-                    print(f"⚠️ Could not update balance cache for signature_type={signature_type}: {e}")
-
-            return client.get_balance_allowance(params)
-        except ImportError:
-            if config.VERBOSE_LOGGING:
-                print("⚠️ py-clob-client-v2 is not installed; falling back to direct CLOB balance API")
-            return None
-        except Exception as e:
-            if config.VERBOSE_LOGGING:
-                print(f"⚠️ SDK balance fetch failed for signature_type={signature_type}: {e}")
-            return None
-
-    def _fetch_balance_allowance_via_rest(self, signature_type: int) -> Optional[Dict]:
-        """Fallback direct REST balance lookup matching the v2 SDK endpoints."""
-        update_url = (
-            f"{self.clob_url}/balance-allowance/update?asset_type=COLLATERAL"
-            f"&signature_type={signature_type}"
-        )
-        self._make_request("GET", update_url, authenticated=True)
-
-        url = (
-            f"{self.clob_url}/balance-allowance?asset_type=COLLATERAL"
-            f"&signature_type={signature_type}"
-        )
-        return self._make_request("GET", url, authenticated=True)
-
-    def _fetch_balance_allowance(self, signature_type: int) -> Optional[Dict]:
-        """Fetch balance/allowance using the SDK first, then REST fallback."""
-        if signature_type == 3 and not getattr(config, "POLYMARKET_CONFIGURED_FUNDER_ADDRESS", None):
-            if config.VERBOSE_LOGGING:
-                print("⚠️ Skipping signature_type=3 probe: no deposit wallet/funder configured")
-            return None
-        result = self._fetch_balance_allowance_via_sdk(signature_type)
-        if result is not None:
-            return result
-        return self._fetch_balance_allowance_via_rest(signature_type)
-
-    def _connect_polygon(self, timeout: int = 60):
-        """Connect to Polygon using the configured RPC plus public fallbacks."""
-        try:
-            from web3 import Web3
-            from web3.middleware import ExtraDataToPOAMiddleware
-        except ImportError:
-            print("❌ web3 package not installed. Install with: pip install web3")
-            return None
-
-        rpc_urls = [
-            config.POLYGON_RPC_URL,
-            "https://polygon-bor-rpc.publicnode.com",
-            "https://polygon-rpc.com",
-            "https://rpc.ankr.com/polygon",
-        ]
-
-        for rpc_url in [url for url in rpc_urls if url]:
-            try:
-                web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": timeout}))
-                web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-                if web3.is_connected():
-                    if config.VERBOSE_LOGGING:
-                        print(f"   🔗 Connected to Polygon RPC: {rpc_url}")
-                    return web3
-            except Exception as e:
-                if config.VERBOSE_LOGGING:
-                    print(f"   ⚠️ Polygon RPC failed ({rpc_url}): {e}")
-
-        print("❌ Cannot redeem: Failed to connect to Polygon network")
-        print("   Set POLYGON_RPC_URL in .env or try again later.")
-        return None
-
-    def _print_legacy_collateral_hint(self):
-        """Explain the common pUSD migration issue when legacy USDC.e is present."""
-        if time.time() - self._last_collateral_hint < 300:
-            return
-        self._last_collateral_hint = time.time()
-
-        try:
-            web3 = self._connect_polygon(timeout=10)
-            if web3 is None:
-                return
-
-            owner = web3.to_checksum_address(self._effective_funder_address())
-            erc20_abi = '[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]'
-            pusd = web3.eth.contract(
-                address=web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"),
-                abi=erc20_abi,
-            )
-            usdce = web3.eth.contract(
-                address=web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
-                abi=erc20_abi,
-            )
-            pusd_balance = pusd.functions.balanceOf(owner).call() / 1_000_000
-            usdce_balance = usdce.functions.balanceOf(owner).call() / 1_000_000
-
-            if pusd_balance <= 0 and usdce_balance > 0:
-                print(
-                    "⚠️ Detected legacy USDC.e in wallet "
-                    f"(${usdce_balance:.2f}) but no pUSD trading collateral."
-                )
-                print("   Polymarket CLOB now reports pUSD balance. Run:")
-                print("   python3 setup_clob_trading.py wrap all")
-                print("   python3 setup_clob_trading.py approve")
-        except Exception:
-            return
-
     def get_usdc_balance(self) -> Optional[float]:
         """
-        Get the user's PUSD balance on Polymarket.
+        Get the user's USDC balance on Polymarket.
         
         This queries the CLOB API for the current available balance.
         In TEST_MODE, returns None (use virtual balance instead).
         
         Returns:
-            PUSD balance as float, or None if error/TEST_MODE
+            USDC balance as float, or None if error/TEST_MODE
             
         Example:
             >>> client = get_client()
@@ -2275,77 +2014,39 @@ class PolymarketClient:
             return None
         
         try:
-            configured_signature_type = self._effective_signature_type()
-            result = self._fetch_balance_allowance(configured_signature_type)
-            balance = self._parse_balance_response(result) if result is not None else None
+            sdk = self._import_clob_sdk()
+            params = sdk["BalanceAllowanceParams"](
+                asset_type=sdk["AssetType"].COLLATERAL,
+                signature_type=config.POLYMARKET_SIGNATURE_TYPE,
+            )
+            clob_client = self._build_clob_client(sdk)
 
-            if (
-                balance is not None
-                and balance <= 0
-                and config.POLYMARKET_AUTO_DETECT_SIGNATURE_TYPE
-                and time.time() - self._last_signature_type_probe >= 300
-            ):
-                self._last_signature_type_probe = time.time()
-                for signature_type in self._signature_types_to_probe():
-                    if signature_type == configured_signature_type:
-                        continue
-
-                    probe_result = self._fetch_balance_allowance(signature_type)
-                    probe_balance = (
-                        self._parse_balance_response(probe_result)
-                        if probe_result is not None
-                        else None
-                    )
-
-                    if probe_balance is not None and probe_balance > 0:
-                        self._detected_signature_type = signature_type
-                        balance = probe_balance
-                        if config.VERBOSE_LOGGING:
-                            print(
-                                "✅ Detected funded Polymarket account "
-                                f"with signature_type={signature_type}. "
-                                "Using it for this session."
-                            )
-                            print(
-                                "   Persist this by setting "
-                                f"POLYMARKET_SIGNATURE_TYPE={signature_type} in .env"
-                            )
-                        break
-
-            if balance is None:
+            try:
+                result = clob_client.get_balance_allowance(params)
+            except Exception as first_error:
+                if not self._is_unauthorized_error(first_error):
+                    raise
+                print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
+                fresh_creds = self._derive_fresh_api_creds(sdk)
+                clob_client = self._build_clob_client(sdk, fresh_creds)
+                result = clob_client.get_balance_allowance(params)
+            
+            if result is None:
                 print("❌ Failed to fetch balance from API")
                 return None
-
-            if config.VERBOSE_LOGGING:
-                print(f"💰 PUSD Balance: ${balance:.2f}")
-
-            if balance <= 0:
-                self._print_legacy_collateral_hint()
-
+            
+            # Parse the balance response
+            # The API may return balance in different formats
+            balance = self._parse_balance_response(result)
+            
+            if balance is not None and config.VERBOSE_LOGGING:
+                print(f"💰 USDC Balance: ${balance:.2f}")
+            
             return balance
             
         except Exception as e:
             print(f"❌ Error fetching balance: {e}")
             return None
-
-    def _amount_to_usdc(self, value: Any, assume_micro_units: bool = False) -> float:
-        """Convert Polymarket numeric amount fields to USDC."""
-        if value is None:
-            return 0.0
-
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if cleaned == "":
-                return 0.0
-            if assume_micro_units and cleaned.isdigit():
-                return int(cleaned) / 1_000_000
-            numeric = float(cleaned)
-        else:
-            numeric = float(value)
-
-        if assume_micro_units or numeric > 10000:
-            return numeric / 1_000_000
-        return numeric
     
     def _parse_balance_response(self, response: Dict) -> Optional[float]:
         """
@@ -2362,39 +2063,42 @@ class PolymarketClient:
         try:
             # Try different possible response formats
             
-            if not isinstance(response, dict):
-                return None
-
-            # Format 1: Direct balance field from CLOB balance-allowance.
-            # The official API returns this as micro-USDC.
+            # Format 1: Direct balance field
             if "balance" in response:
-                return self._amount_to_usdc(response["balance"], assume_micro_units=True)
+                balance_raw = response["balance"]
+                # Balance might be in smallest units (6 decimals for USDC)
+                if isinstance(balance_raw, str):
+                    balance_raw = float(balance_raw)
+                # Check if balance is in micro-units (> 1000 suggests smallest units)
+                if balance_raw > 10000:
+                    return balance_raw / 1_000_000  # USDC has 6 decimals
+                return float(balance_raw)
             
             # Format 2: USDC specific field
             if "usdc" in response:
-                return self._amount_to_usdc(response["usdc"])
+                return float(response["usdc"])
             
             # Format 3: Available balance
             if "available" in response:
-                return self._amount_to_usdc(response["available"])
+                return float(response["available"])
             
             # Format 4: Nested balance object
             if "balances" in response:
                 balances = response["balances"]
                 if isinstance(balances, dict):
-                    # Look for PUSD balance
+                    # Look for USDC balance
                     for key in ["USDC", "usdc", "usd"]:
                         if key in balances:
-                            return self._amount_to_usdc(balances[key])
+                            return float(balances[key])
                 elif isinstance(balances, list):
                     # Find USDC in list of balances
                     for bal in balances:
                         if bal.get("asset", "").upper() == "USDC":
-                            return self._amount_to_usdc(bal.get("amount", 0))
+                            return float(bal.get("amount", 0))
             
             # Format 5: Collateral balance (Polymarket specific)
             if "collateral" in response:
-                return self._amount_to_usdc(response["collateral"], assume_micro_units=True)
+                return float(response["collateral"])
             
             print(f"⚠️ Unknown balance response format: {list(response.keys())}")
             return None
@@ -2418,7 +2122,22 @@ class PolymarketClient:
             return None
         
         try:
-            result = self._fetch_balance_allowance(self._effective_signature_type())
+            sdk = self._import_clob_sdk()
+            params = sdk["BalanceAllowanceParams"](
+                asset_type=sdk["AssetType"].COLLATERAL,
+                signature_type=config.POLYMARKET_SIGNATURE_TYPE,
+            )
+            clob_client = self._build_clob_client(sdk)
+
+            try:
+                result = clob_client.get_balance_allowance(params)
+            except Exception as first_error:
+                if not self._is_unauthorized_error(first_error):
+                    raise
+                print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
+                fresh_creds = self._derive_fresh_api_creds(sdk)
+                clob_client = self._build_clob_client(sdk, fresh_creds)
+                result = clob_client.get_balance_allowance(params)
             
             if result is None:
                 return None
@@ -2429,10 +2148,10 @@ class PolymarketClient:
             # The response should contain balance field
             if isinstance(result, dict):
                 if "balance" in result:
-                    balances["USDC"] = self._amount_to_usdc(result["balance"], assume_micro_units=True)
+                    balances["USDC"] = float(result["balance"])
                 for key, value in result.items():
                     try:
-                        balances[key] = self._amount_to_usdc(value)
+                        balances[key] = float(value)
                     except (ValueError, TypeError):
                         continue
             elif isinstance(result, list):
@@ -2453,7 +2172,7 @@ class PolymarketClient:
     
     def verify_sufficient_balance(self, required_amount: float) -> bool:
         """
-        Verify that the account has sufficient PUSD balance for a trade.
+        Verify that the account has sufficient USDC balance for a trade.
         
         Args:
             required_amount: Amount in USD needed for the trade
@@ -2512,42 +2231,38 @@ class PolymarketClient:
             return None
         
         try:
-            account_addresses = self._account_addresses_for_data_api()
-            if not account_addresses:
-                print("❌ WALLET_ADDRESS/POLYMARKET_FUNDER_ADDRESS not configured")
+            # Use Polymarket data-api for positions - this is the correct endpoint
+            # The CLOB API does NOT have a /positions endpoint
+            wallet_address = config.WALLET_ADDRESS
+            if not wallet_address:
+                print("❌ WALLET_ADDRESS not configured")
                 return None
             
             # Data API endpoint for user positions
             data_api_url = "https://data-api.polymarket.com"
             url = f"{data_api_url}/positions"
-            seen_tokens = set()
+            params = {"user": wallet_address.lower()}
+            
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
             positions = []
-
-            for account_address in account_addresses:
-                params = {"user": account_address}
-                
-                response = requests.get(url, params=params, timeout=30)
-                response.raise_for_status()
-                result = response.json()
-                
-                raw_items = []
-                if isinstance(result, list):
-                    raw_items = result
-                elif isinstance(result, dict) and "positions" in result:
-                    raw_items = result["positions"]
-                
-                for item in raw_items:
-                    if not isinstance(item, dict):
-                        continue
-                    parsed = self._parse_data_api_position(item)
-                    parsed["owner"] = account_address
-                    token_id = parsed.get("token_id")
-                    if parsed.get("size", 0) <= 0 or not token_id:
-                        continue
-                    if token_id in seen_tokens:
-                        continue
-                    seen_tokens.add(token_id)
-                    positions.append(parsed)
+            
+            # Handle the data-api response format
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict):
+                        parsed = self._parse_data_api_position(item)
+                        # Only include positions with actual shares
+                        if parsed.get("size", 0) > 0:
+                            positions.append(parsed)
+            elif isinstance(result, dict):
+                if "positions" in result:
+                    for item in result["positions"]:
+                        parsed = self._parse_data_api_position(item)
+                        if parsed.get("size", 0) > 0:
+                            positions.append(parsed)
             
             if config.VERBOSE_LOGGING:
                 if positions:
@@ -2601,7 +2316,7 @@ class PolymarketClient:
             "initial_value": float(data.get("initialValue") or 0),
             "cash_pnl": float(data.get("cashPnl") or 0),
             "percent_pnl": float(data.get("percentPnl") or 0),
-            "redeemable": data.get("redeemable"),
+            "redeemable": data.get("redeemable", False),
             "end_date": data.get("endDate"),
             "raw": data  # Keep raw data for debugging
         }
@@ -2722,9 +2437,9 @@ class PolymarketClient:
         """
         Redeem winning shares on-chain via the CTF (Conditional Token Framework) contract.
         
-        After a market resolves, winning shares can be redeemed for pUSD by calling
+        After a market resolves, winning shares can be redeemed for USDC by calling
         the `redeemPositions` function on the CTF contract. This burns the conditional
-        tokens and returns the underlying collateral.
+        tokens and returns the underlying USDC collateral.
         
         Args:
             token_id: The token ID of the winning position
@@ -2776,7 +2491,6 @@ class PolymarketClient:
         current_shares = position.get("size", 0)
         cur_price = position.get("current_price", 0)
         condition_id = position.get("condition_id") or position.get("market_id")
-        redeemable = position.get("redeemable")
         
         # If current price is 0.0, it's a losing position (no redemption needed)
         if cur_price == 0:
@@ -2789,7 +2503,7 @@ class PolymarketClient:
             }
         
         # If current price is 1.0, it's a winning position - attempt on-chain redemption
-        if (cur_price == 1.0 or cur_price >= 0.99) and redeemable is not False:
+        if cur_price == 1.0 or cur_price >= 0.99:
             estimated_value = current_shares * 1.0
             print(f"💰 Winning position found: {current_shares:.4f} shares (~${estimated_value:.2f})")
             
@@ -2799,8 +2513,6 @@ class PolymarketClient:
                     try:
                         result = self._execute_onchain_redemption(condition_id, token_id, current_shares)
                         if result and result.get("success"):
-                            return result
-                        if result and result.get("needs_manual_redemption"):
                             return result
                         if attempt < max_retries - 1:
                             print(f"⚠️ Redemption attempt {attempt + 1} failed, retrying in 15s...")
@@ -2829,7 +2541,7 @@ class PolymarketClient:
             "amount_usdc": 0,
             "shares_redeemed": 0,
             "method": "market_not_resolved",
-            "message": f"Market may not be resolved/redeemable yet (price: {cur_price}, redeemable={redeemable})"
+            "message": f"Market may not be resolved yet (price: {cur_price})"
         }
     
     def _execute_onchain_redemption(
@@ -2842,7 +2554,7 @@ class PolymarketClient:
         Execute on-chain redemption via the CTF contract.
         
         Calls `redeemPositions` on the Conditional Token Framework (CTF) contract
-        to burn winning outcome tokens and receive pUSD collateral.
+        to burn winning outcome tokens and receive USDC collateral.
         
         Args:
             condition_id: The condition ID of the resolved market
@@ -2859,8 +2571,7 @@ class PolymarketClient:
             
             # Contract addresses (Polygon Mainnet)
             CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-            PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-            USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
             
             # CTF redeemPositions ABI
             CTF_ABI = [
@@ -2875,37 +2586,6 @@ class PolymarketClient:
                     "outputs": [],
                     "stateMutability": "nonpayable",
                     "type": "function"
-                },
-                {
-                    "inputs": [
-                        {"name": "parentCollectionId", "type": "bytes32"},
-                        {"name": "conditionId", "type": "bytes32"},
-                        {"name": "indexSet", "type": "uint256"}
-                    ],
-                    "name": "getCollectionId",
-                    "outputs": [{"name": "", "type": "bytes32"}],
-                    "stateMutability": "view",
-                    "type": "function"
-                },
-                {
-                    "inputs": [
-                        {"name": "collateralToken", "type": "address"},
-                        {"name": "collectionId", "type": "bytes32"}
-                    ],
-                    "name": "getPositionId",
-                    "outputs": [{"name": "", "type": "uint256"}],
-                    "stateMutability": "view",
-                    "type": "function"
-                },
-                {
-                    "inputs": [
-                        {"name": "account", "type": "address"},
-                        {"name": "id", "type": "uint256"}
-                    ],
-                    "name": "balanceOf",
-                    "outputs": [{"name": "", "type": "uint256"}],
-                    "stateMutability": "view",
-                    "type": "function"
                 }
             ]
             
@@ -2917,17 +2597,16 @@ class PolymarketClient:
                 print("❌ Cannot redeem: WALLET_PRIVATE_KEY and WALLET_ADDRESS required")
                 return None
             
-            web3 = self._connect_polygon(timeout=60)
-            if web3 is None:
+            # Connect to Polygon
+            rpc_url = getattr(config, 'POLYGON_RPC_URL', "https://polygon-bor-rpc.publicnode.com")
+            web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
+            web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            
+            if not web3.is_connected():
+                print("❌ Cannot redeem: Failed to connect to Polygon network")
                 return None
             
             wallet_address = web3.to_checksum_address(wallet_address)
-            funder_address = self._effective_funder_address()
-            funder_checksum = (
-                web3.to_checksum_address(funder_address)
-                if funder_address
-                else wallet_address
-            )
             
             # Create CTF contract instance
             ctf_contract = web3.eth.contract(
@@ -2945,159 +2624,65 @@ class PolymarketClient:
             # Parent collection ID is null (bytes32 zero) for Polymarket
             parent_collection_id = bytes(32)
             
+            # Index sets: [1, 2] represents YES and NO outcomes
+            # The contract will only pay out for winning outcomes
+            index_sets = [1, 2]
+            
             print(f"   🔗 Executing on-chain redemption...")
             print(f"      Condition ID: {condition_id[:16]}...")
             print(f"      Shares: {shares:.4f}")
             
-            token_id_int = int(token_id)
-            token_balance_before = ctf_contract.functions.balanceOf(
-                wallet_address,
-                token_id_int,
-            ).call()
-            if token_balance_before <= 0:
-                funder_balance = 0
-                if funder_checksum != wallet_address:
-                    funder_balance = ctf_contract.functions.balanceOf(
-                        funder_checksum,
-                        token_id_int,
-                    ).call()
-
-                if funder_balance > 0:
-                    print("   ⚠️ Winning position is held by the funder/deposit wallet, not the signer wallet.")
-                    print("   Automatic direct redemption requires the signer wallet to hold the CTF tokens.")
-                    return {
-                        "success": False,
-                        "amount_usdc": 0,
-                        "shares_redeemed": 0,
-                        "needs_manual_redemption": True,
-                        "method": "deposit_wallet_manual_required",
-                        "message": "Redeem from the Polymarket portfolio or a deposit-wallet relayer flow.",
-                    }
-
-                print("   ℹ️ Position already redeemed or no longer held on-chain")
+            # Build transaction
+            nonce = web3.eth.get_transaction_count(wallet_address)
+            gas_price = web3.eth.gas_price
+            
+            tx = ctf_contract.functions.redeemPositions(
+                web3.to_checksum_address(USDC_ADDRESS),
+                parent_collection_id,
+                condition_id_bytes,
+                index_sets
+            ).build_transaction({
+                'from': wallet_address,
+                'nonce': nonce,
+                'gas': 200000,  # Estimate, will be adjusted
+                'gasPrice': gas_price,
+                'chainId': 137  # Polygon Mainnet
+            })
+            
+            # Estimate gas
+            try:
+                gas_estimate = web3.eth.estimate_gas(tx)
+                tx['gas'] = int(gas_estimate * 1.2)  # Add 20% buffer
+            except Exception as e:
+                print(f"   ⚠️ Gas estimation failed: {e}")
+                # Continue with default gas
+            
+            # Sign and send transaction
+            signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+            
+            print(f"   📤 Transaction sent: {tx_hash_hex}")
+            print(f"   ⏳ Waiting for confirmation...")
+            
+            # Wait for transaction receipt
+            receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            
+            if receipt['status'] == 1:
+                print(f"   ✅ Redemption successful!")
+                print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
+                
                 return {
                     "success": True,
-                    "amount_usdc": 0,
-                    "shares_redeemed": 0,
-                    "method": "already_redeemed",
+                    "amount_usdc": shares,  # Winning shares = USDC
+                    "shares_redeemed": shares,
+                    "method": "onchain_redemption",
+                    "tx_hash": tx_hash_hex,
+                    "gas_used": receipt['gasUsed']
                 }
-
-            collateral_candidates = [
-                ("pUSD", PUSD_ADDRESS),
-                ("legacy USDC.e", USDCE_ADDRESS),
-                ("CTF collateral adapter", "0xAdA100Db00Ca00073811820692005400218FcE1f"),
-                ("Neg-risk CTF collateral adapter", "0xadA2005600Dec949baf300f4C6120000bDB6eAab"),
-            ]
-
-            matched_candidates = []
-            for index_set in [1, 2]:
-                collection_id = ctf_contract.functions.getCollectionId(
-                    parent_collection_id,
-                    condition_id_bytes,
-                    index_set,
-                ).call()
-                for collateral_name, collateral_address in collateral_candidates:
-                    position_id = ctf_contract.functions.getPositionId(
-                        web3.to_checksum_address(collateral_address),
-                        collection_id,
-                    ).call()
-                    if position_id == token_id_int:
-                        matched_candidates.append((collateral_name, collateral_address, index_set))
-
-            if not matched_candidates:
-                print("   ⚠️ Could not derive collateral/index set from token ID; trying safe fallbacks")
-                matched_candidates = [
-                    (collateral_name, collateral_address, index_set)
-                    for collateral_name, collateral_address in collateral_candidates
-                    for index_set in [1, 2]
-                ]
-
-            last_error = None
-            for collateral_name, collateral_address, index_set in matched_candidates:
-                try:
-                    print(f"      Collateral: {collateral_name} | indexSet={index_set}")
-                    nonce = web3.eth.get_transaction_count(wallet_address)
-                    gas_price = web3.eth.gas_price
-
-                    tx = ctf_contract.functions.redeemPositions(
-                        web3.to_checksum_address(collateral_address),
-                        parent_collection_id,
-                        condition_id_bytes,
-                        [index_set]
-                    ).build_transaction({
-                        'from': wallet_address,
-                        'nonce': nonce,
-                        'gasPrice': gas_price,
-                        'chainId': 137
-                    })
-
-                    try:
-                        gas_estimate = web3.eth.estimate_gas(tx)
-                        tx['gas'] = int(gas_estimate * 1.2)
-                    except Exception as e:
-                        last_error = e
-                        print(f"      ⚠️ {collateral_name} redemption not estimable: {e}")
-                        continue
-
-                    signed_tx = web3.eth.account.sign_transaction(tx, private_key)
-                    tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                    tx_hash_hex = tx_hash.hex()
-
-                    print(f"   📤 Transaction sent: {tx_hash_hex}")
-                    print(f"   ⏳ Waiting for confirmation...")
-
-                    receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-
-                    if receipt['status'] == 1:
-                        token_balance_after = ctf_contract.functions.balanceOf(
-                            wallet_address,
-                            token_id_int,
-                        ).call()
-                        shares_burned = max(token_balance_before - token_balance_after, 0) / 1_000_000
-
-                        if shares_burned <= 0:
-                            print("   ⚠️ Transaction succeeded but did not burn the winning position")
-                            print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
-                            last_error = "redemption transaction did not burn shares"
-                            continue
-
-                        print(f"   ✅ Redemption successful!")
-                        print(f"      Burned: {shares_burned:.4f} shares")
-                        print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
-
-                        result = {
-                            "success": True,
-                            "amount_usdc": shares_burned,
-                            "shares_redeemed": shares_burned,
-                            "method": "onchain_redemption",
-                            "collateral": collateral_name,
-                            "index_set": index_set,
-                            "tx_hash": tx_hash_hex,
-                            "gas_used": receipt['gasUsed']
-                        }
-                        # Some legacy/adapter-backed redemptions credit USDC.e even
-                        # when the CLOB displays pUSD buying power. Wrap whatever
-                        # USDC.e is present after any successful redeem.
-                        wrap_result = self._wrap_legacy_usdce_to_pusd(
-                            web3,
-                            wallet_address,
-                            private_key,
-                            USDCE_ADDRESS,
-                        )
-                        if wrap_result:
-                            result.update(wrap_result)
-
-                        return result
-
-                    print(f"   ❌ Transaction failed (reverted)")
-                    last_error = "transaction reverted"
-                except Exception as e:
-                    last_error = e
-                    print(f"      ⚠️ {collateral_name} redemption failed: {e}")
-
-            if last_error:
-                print(f"   ❌ Redemption failed for all collateral options: {last_error}")
-            return None
+            else:
+                print(f"   ❌ Transaction failed (reverted)")
+                return None
                 
         except ImportError:
             print("❌ web3 package not installed. Install with: pip install web3")
@@ -3105,147 +2690,6 @@ class PolymarketClient:
         except Exception as e:
             print(f"❌ On-chain redemption error: {e}")
             return None
-
-    def _wrap_legacy_usdce_to_pusd(
-        self,
-        web3,
-        wallet_address: str,
-        private_key: str,
-        usdce_address: str,
-    ) -> Optional[Dict]:
-        """Wrap any legacy USDC.e balance into pUSD after an old collateral redeem."""
-        try:
-            from web3.constants import MAX_INT
-
-            collateral_onramp_address = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
-            erc20_abi = [
-                {
-                    "constant": True,
-                    "inputs": [{"name": "_owner", "type": "address"}],
-                    "name": "balanceOf",
-                    "outputs": [{"name": "balance", "type": "uint256"}],
-                    "type": "function",
-                },
-                {
-                    "constant": True,
-                    "inputs": [
-                        {"name": "_owner", "type": "address"},
-                        {"name": "_spender", "type": "address"},
-                    ],
-                    "name": "allowance",
-                    "outputs": [{"name": "remaining", "type": "uint256"}],
-                    "type": "function",
-                },
-                {
-                    "constant": False,
-                    "inputs": [
-                        {"name": "_spender", "type": "address"},
-                        {"name": "_value", "type": "uint256"},
-                    ],
-                    "name": "approve",
-                    "outputs": [{"name": "", "type": "bool"}],
-                    "stateMutability": "nonpayable",
-                    "type": "function",
-                },
-            ]
-            onramp_abi = [
-                {
-                    "inputs": [
-                        {"internalType": "address", "name": "_asset", "type": "address"},
-                        {"internalType": "address", "name": "_to", "type": "address"},
-                        {"internalType": "uint256", "name": "_amount", "type": "uint256"},
-                    ],
-                    "name": "wrap",
-                    "outputs": [],
-                    "stateMutability": "nonpayable",
-                    "type": "function",
-                }
-            ]
-
-            usdce = web3.eth.contract(
-                address=web3.to_checksum_address(usdce_address),
-                abi=erc20_abi,
-            )
-            onramp_checksum = web3.to_checksum_address(collateral_onramp_address)
-            onramp = web3.eth.contract(address=onramp_checksum, abi=onramp_abi)
-
-            amount_units = usdce.functions.balanceOf(wallet_address).call()
-            if amount_units <= 0:
-                return None
-
-            amount = amount_units / 1_000_000
-            print(f"   🔁 Wrapping redeemed legacy USDC.e into pUSD: ${amount:.6f}")
-
-            nonce = web3.eth.get_transaction_count(wallet_address)
-            allowance = usdce.functions.allowance(wallet_address, onramp_checksum).call()
-            tx_hashes = []
-            max_int = int(MAX_INT, 0) if isinstance(MAX_INT, str) else int(MAX_INT)
-
-            if allowance < amount_units:
-                approve_tx = usdce.functions.approve(
-                    onramp_checksum,
-                    max_int,
-                ).build_transaction({
-                    "chainId": 137,
-                    "from": wallet_address,
-                    "nonce": nonce,
-                    "gasPrice": web3.eth.gas_price,
-                })
-                approve_tx["gas"] = int(web3.eth.estimate_gas(approve_tx) * 1.2)
-                signed_approve = web3.eth.account.sign_transaction(approve_tx, private_key)
-                approve_hash = web3.eth.send_raw_transaction(signed_approve.raw_transaction)
-                approve_hash_hex = approve_hash.hex()
-                tx_hashes.append(approve_hash_hex)
-                print(f"      Approval sent: {approve_hash_hex}")
-                approve_receipt = web3.eth.wait_for_transaction_receipt(approve_hash, timeout=180)
-                if approve_receipt["status"] != 1:
-                    print("      ⚠️ USDC.e approval for wrapping failed")
-                    return {
-                        "wrapped_to_pusd": False,
-                        "wrap_error": "USDC.e approval failed",
-                        "wrap_tx_hashes": tx_hashes,
-                    }
-                nonce += 1
-
-            wrap_tx = onramp.functions.wrap(
-                web3.to_checksum_address(usdce_address),
-                wallet_address,
-                amount_units,
-            ).build_transaction({
-                "chainId": 137,
-                "from": wallet_address,
-                "nonce": nonce,
-                "gasPrice": web3.eth.gas_price,
-            })
-            wrap_tx["gas"] = int(web3.eth.estimate_gas(wrap_tx) * 1.2)
-            signed_wrap = web3.eth.account.sign_transaction(wrap_tx, private_key)
-            wrap_hash = web3.eth.send_raw_transaction(signed_wrap.raw_transaction)
-            wrap_hash_hex = wrap_hash.hex()
-            tx_hashes.append(wrap_hash_hex)
-            print(f"      Wrap sent: {wrap_hash_hex}")
-            wrap_receipt = web3.eth.wait_for_transaction_receipt(wrap_hash, timeout=180)
-
-            if wrap_receipt["status"] == 1:
-                print(f"   ✅ Wrapped ${amount:.6f} USDC.e into pUSD")
-                return {
-                    "wrapped_to_pusd": True,
-                    "wrapped_amount": amount,
-                    "wrap_tx_hash": wrap_hash_hex,
-                    "wrap_tx_hashes": tx_hashes,
-                }
-
-            print("      ⚠️ USDC.e → pUSD wrap transaction failed")
-            return {
-                "wrapped_to_pusd": False,
-                "wrap_error": "wrap transaction failed",
-                "wrap_tx_hashes": tx_hashes,
-            }
-        except Exception as e:
-            print(f"      ⚠️ Could not auto-wrap redeemed USDC.e into pUSD: {e}")
-            return {
-                "wrapped_to_pusd": False,
-                "wrap_error": str(e),
-            }
     
     def _execute_redemption(self, token_id: str, shares: Optional[float]) -> Optional[Dict]:
         """
@@ -3292,7 +2736,7 @@ class PolymarketClient:
         
         Some Polymarket markets auto-redeem winning positions.
         We can detect this by checking if the position is gone
-        but our PUSD balance increased.
+        but our USDC balance increased.
         """
         try:
             # Check current position
@@ -3303,7 +2747,7 @@ class PolymarketClient:
                 return None
             
             # Position is gone or empty - might be auto-redeemed
-            # We can't verify the PUSD credit easily, so assume success
+            # We can't verify the USDC credit easily, so assume success
             # if the position is gone
             if position is None or position.get("size", 0) == 0:
                 if config.VERBOSE_LOGGING:
@@ -3332,7 +2776,7 @@ class PolymarketClient:
         Positions with current_price ~= 0 are LOSING positions and are skipped.
         
         For each winning position, this method calls the CTF contract's
-        `redeemPositions` function to burn tokens and receive pUSD.
+        `redeemPositions` function to burn tokens and receive USDC.
         
         Returns:
             Dict with summary of redemption results
@@ -3383,7 +2827,6 @@ class PolymarketClient:
             token_id = pos.get("token_id")
             shares = pos.get("size", 0)
             cur_price = pos.get("current_price", 0)
-            redeemable = pos.get("redeemable")
             title = pos.get("title", "Unknown")[:40]
             
             if not token_id or shares <= 0:
@@ -3397,7 +2840,7 @@ class PolymarketClient:
             if cur_price < 0.10:
                 # This is a LOSING position (resolved to ~0) - no value to redeem
                 losing_positions += 1
-                if config.VERBOSE_LOGGING and getattr(config, "REDEMPTION_VERBOSE_LOSSES", False):
+                if config.VERBOSE_LOGGING:
                     print(f"   ❌ LOSS: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - skipping")
                 continue
             elif cur_price < 0.90:
@@ -3405,11 +2848,6 @@ class PolymarketClient:
                 unresolved_positions += 1
                 if config.VERBOSE_LOGGING:
                     print(f"   ⏳ PENDING: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - not resolved")
-                continue
-            elif redeemable is False:
-                unresolved_positions += 1
-                if config.VERBOSE_LOGGING:
-                    print(f"   ⏳ NOT REDEEMABLE: {title}... ({shares:.2f} shares @ ${cur_price:.2f})")
                 continue
             
             # ════════════════════════════════════════════════════════════════
@@ -3430,11 +2868,6 @@ class PolymarketClient:
                     amount = result.get("amount_usdc", 0)
                     total_redeemed += amount
                     print(f"      ✅ Redeemed ${amount:.2f} on-chain")
-                    if result.get("collateral") == "legacy USDC.e":
-                        if result.get("wrapped_to_pusd"):
-                            print(f"      ✅ Auto-wrapped ${result.get('wrapped_amount', amount):.2f} USDC.e into pUSD")
-                        else:
-                            print("      ℹ️ Redeemed into USDC.e. Run 'python3 setup_clob_trading.py wrap all' to convert it to pUSD CLOB balance.")
                 elif result.get("method") == "already_redeemed":
                     already_redeemed += 1
                     print(f"      ✅ Already redeemed")

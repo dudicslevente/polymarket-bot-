@@ -397,8 +397,10 @@ def wrap_usdce_to_pusd(amount_arg=None):
 def check_clob_status():
     """Check current CLOB balance and allowance status."""
     try:
-        from py_clob_client_v2 import ApiCreds, ClobClient
-        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        try:
+            from py_clob_client_v2 import ApiCreds, AssetType, BalanceAllowanceParams, ClobClient
+        except ImportError:
+            from py_clob_client import ApiCreds, AssetType, BalanceAllowanceParams, ClobClient
         
         private_key = os.getenv('WALLET_PRIVATE_KEY')
         if not private_key:

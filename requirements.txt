@@ -25,8 +25,8 @@ web3>=6.0.0
 # aiohttp>=3.9.0
 
 # For Polymarket CLOB API interactions
-# Polymarket official Python client (v2)
-py_clob_client_v2>=1.0.0
+# Polymarket official Python client (v2 required for CLOB v2 order signing)
+py-clob-client-v2>=1.0.1
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # LIVE TRADING DEPENDENCIES (Required for TEST_MODE=false)

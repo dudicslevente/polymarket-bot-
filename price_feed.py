@@ -59,6 +59,7 @@ class BinanceClient:
         self._api_calls: List[float] = []
         self._last_successful_endpoint: str = self.base_url
         self._cached_price: Optional[Tuple[float, float]] = None  # (price, timestamp)
+        self._cached_changes: Dict[int, Tuple[PriceChange, float]] = {}
     
     def _rate_limit_check(self):
         """Ensure we don't exceed Binance rate limits."""
@@ -172,10 +173,67 @@ class BinanceClient:
             if (now - p.timestamp).total_seconds() < 600
         ]
     
+    def get_server_time_ms(self) -> int:
+        """
+        Get Binance server time in milliseconds.
+
+        Falls back to local wall-clock time if Binance time is unavailable.
+        """
+        data = self._make_request("/api/v3/time")
+
+        if data:
+            try:
+                server_time = int(data.get("serverTime", 0))
+                if server_time > 0:
+                    return server_time
+            except (ValueError, TypeError):
+                pass
+
+        return int(time.time() * 1000)
+
+    def get_aggregate_trades(
+        self,
+        start_time_ms: int,
+        end_time_ms: Optional[int] = None,
+        limit: int = 1000
+    ) -> Optional[List[Dict]]:
+        """
+        Fetch BTCUSDT aggregate trades in a time window.
+
+        Aggregate trades give a much closer point-in-time price than 1-minute
+        candle closes, which can otherwise understate short lookback moves.
+        """
+        params = {
+            "symbol": "BTCUSDT",
+            "startTime": start_time_ms,
+            "limit": limit,
+        }
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+
+        data = self._make_request("/api/v3/aggTrades", params)
+
+        if not data or not isinstance(data, list):
+            return None
+
+        trades = []
+        for trade in data:
+            try:
+                trades.append({
+                    "price": float(trade["p"]),
+                    "timestamp": int(trade["T"]),
+                })
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        return trades if trades else None
+
     def get_klines(
-        self, 
-        interval: str = "1m", 
-        limit: int = 10
+        self,
+        interval: str = "1m",
+        limit: int = 10,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None
     ) -> Optional[List[Dict]]:
         """
         Fetch candlestick (kline) data for BTCUSDT.
@@ -192,6 +250,10 @@ class BinanceClient:
             "interval": interval,
             "limit": limit
         }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
         
         data = self._make_request("/api/v3/klines", params)
         
@@ -215,27 +277,70 @@ class BinanceClient:
         
         return klines if klines else None
     
+    def get_price_at_time(self, target_time_ms: int) -> Optional[float]:
+        """
+        Get the BTC price nearest to a specific timestamp.
+
+        Uses aggregate trades first for point-in-time accuracy. Falls back to
+        nearby 1-minute candles only if trades are unavailable.
+        """
+        candidates = []
+
+        # BTCUSDT is liquid, so a small window usually finds trades on both
+        # sides of the target timestamp. Expand once for rare quiet/API cases.
+        for window_ms in (10_000, 60_000):
+            before = self.get_aggregate_trades(
+                start_time_ms=max(0, target_time_ms - window_ms),
+                end_time_ms=target_time_ms,
+                limit=1000,
+            )
+            if before:
+                candidates.append(before[-1])
+
+            after = self.get_aggregate_trades(
+                start_time_ms=target_time_ms,
+                end_time_ms=target_time_ms + window_ms,
+                limit=1,
+            )
+            if after:
+                candidates.append(after[0])
+
+            if candidates:
+                nearest = min(
+                    candidates,
+                    key=lambda trade: abs(trade["timestamp"] - target_time_ms),
+                )
+                return nearest["price"]
+
+        # Fallback: choose the nearest candle close at or before the target.
+        klines = self.get_klines(
+            interval="1m",
+            limit=3,
+            end_time_ms=target_time_ms,
+        )
+        if klines:
+            past_candles = [
+                candle for candle in klines
+                if candle.get("close_time", 0) <= target_time_ms
+            ]
+            if past_candles:
+                return past_candles[-1]["close"]
+            return klines[0]["open"]
+
+        return None
+
     def get_price_n_minutes_ago(self, minutes: int) -> Optional[float]:
         """
         Get the BTC price from N minutes ago.
-        
-        Uses kline data to find historical price.
+
+        Uses point-in-time trade data to avoid short-window underreporting from
+        1-minute candle boundaries.
         """
-        # Fetch enough candles to cover the time period
-        # Add a buffer for safety
-        klines = self.get_klines(interval="1m", limit=minutes + 2)
-        
-        if not klines or len(klines) < minutes:
+        if minutes <= 0:
             return None
-        
-        try:
-            # Index from the end: -1 is current, -N is N minutes ago
-            # But klines are ordered oldest to newest
-            # So index 0 is oldest
-            target_index = max(0, len(klines) - minutes - 1)
-            return klines[target_index]["close"]
-        except (IndexError, KeyError):
-            return None
+
+        target_time_ms = self.get_server_time_ms() - (minutes * 60_000)
+        return self.get_price_at_time(target_time_ms)
     
     def calculate_price_change(self, minutes: int) -> Optional[PriceChange]:
         """
@@ -248,6 +353,12 @@ class BinanceClient:
             PriceChange object with absolute and percentage change,
             or None if data is unavailable.
         """
+        cached_change = self._cached_changes.get(minutes)
+        if cached_change:
+            change, cached_time = cached_change
+            if time.time() - cached_time < 1:
+                return change
+
         current_price = self.get_btc_price()
         if current_price is None:
             return None
@@ -262,13 +373,15 @@ class BinanceClient:
         change_absolute = current_price - past_price
         change_percent = (change_absolute / past_price) * 100
         
-        return PriceChange(
+        change = PriceChange(
             start_price=past_price,
             end_price=current_price,
             change_absolute=change_absolute,
             change_percent=change_percent,
             period_minutes=minutes
         )
+        self._cached_changes[minutes] = (change, time.time())
+        return change
     
     def get_btc_bias(self) -> Tuple[Optional[str], Optional[float], Optional[float]]:
         """
@@ -298,7 +411,11 @@ class BinanceClient:
         
         if config.VERBOSE_LOGGING:
             direction = "↑" if change_percent >= 0 else "↓"
-            print(f"📈 BTC: ${current_price:,.2f} | {config.BTC_LOOKBACK_MINUTES}m change: {direction}{abs(change_percent):.3f}%")
+            print(
+                f"📈 BTC: ${current_price:,.2f} | "
+                f"{config.BTC_LOOKBACK_MINUTES}m change: {direction}{abs(change_percent):.4f}% "
+                f"(${change.start_price:,.2f} → ${change.end_price:,.2f})"
+            )
         
         # Determine bias based on threshold
         if change_percent >= threshold:

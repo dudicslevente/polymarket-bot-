@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import config
 from market import Market, PolymarketClient
-from price_feed import BinanceClient, get_btc_bias
+from price_feed import BinanceClient
 
 
 @dataclass
@@ -304,7 +304,7 @@ def analyze_trade_opportunity(
     # ─────────────────────────────────────────────────────────────────────────
     # FILTER 5: BTC Bias Detection
     # ─────────────────────────────────────────────────────────────────────────
-    bias, change_percent, btc_price = get_btc_bias()
+    bias, change_percent, btc_price = binance_client.get_btc_bias()
     
     if btc_price:
         signal.btc_price = btc_price

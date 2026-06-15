@@ -93,7 +93,10 @@ class PolymarketAuth:
         # This avoids stale or revoked API keys in .env causing 401 failures.
         if wallet_address and private_key:
             try:
-                from py_clob_client_v2 import ClobClient
+                try:
+                    from py_clob_client_v2 import ClobClient
+                except ImportError:
+                    from py_clob_client import ClobClient
 
                 if (
                     config.POLYMARKET_SIGNATURE_TYPE == 3
@@ -114,9 +117,14 @@ class PolymarketAuth:
                 try:
                     derived = client.derive_api_key()
                 except Exception:
-                    if api_key and api_secret and passphrase:
+                    create_or_derive = getattr(client, "create_or_derive_api_key", None)
+                    create_key = getattr(client, "create_api_key", None)
+                    if create_or_derive is not None:
+                        derived = create_or_derive()
+                    elif create_key is not None and not (api_key and api_secret and passphrase):
+                        derived = create_key()
+                    else:
                         raise
-                    derived = client.create_or_derive_api_key()
                 api_key = derived.api_key or api_key
                 api_secret = derived.api_secret or api_secret
                 passphrase = derived.api_passphrase or passphrase

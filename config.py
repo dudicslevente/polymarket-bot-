@@ -267,6 +267,15 @@ REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "300
 # Disabled by default because old losing positions can make redemption logs very noisy.
 REDEMPTION_VERBOSE_LOSSES: bool = os.getenv("REDEMPTION_VERBOSE_LOSSES", "false").lower() == "true"
 
+# Automatically wrap any legacy USDC.e found in the wallet into pUSD.
+# This is enabled by default because some Polymarket redemptions still pay out
+# USDC.e even when the bot trades from pUSD CLOB balance.
+AUTO_WRAP_USDCE_TO_PUSD: bool = os.getenv("AUTO_WRAP_USDCE_TO_PUSD", "true").lower() == "true"
+
+# Throttle the safety-net wrap check so normal balance polling does not hit RPC
+# every scan. Successful redemption still checks immediately.
+AUTO_WRAP_USDCE_CHECK_INTERVAL: int = int(os.getenv("AUTO_WRAP_USDCE_CHECK_INTERVAL", "120"))
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING

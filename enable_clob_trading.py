@@ -14,7 +14,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def main():
-    from py_clob_client_v2 import ClobClient
+    try:
+        from py_clob_client_v2 import ClobClient
+    except ImportError:
+        from py_clob_client import ClobClient
     
     private_key = os.getenv('WALLET_PRIVATE_KEY')
     if not private_key:
@@ -51,7 +54,10 @@ def main():
     print()
     
     # Check current allowance
-    from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+    try:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+    except ImportError:
+        from py_clob_client import AssetType, BalanceAllowanceParams
     
     try:
         params = BalanceAllowanceParams(

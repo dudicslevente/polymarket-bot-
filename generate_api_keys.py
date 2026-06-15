@@ -1,5 +1,8 @@
 import os
-from py_clob_client_v2 import ClobClient
+try:
+    from py_clob_client_v2 import ClobClient
+except ImportError:
+    from py_clob_client import ClobClient
 from dotenv import load_dotenv
 # Load the environment variables from the .env file
 load_dotenv()

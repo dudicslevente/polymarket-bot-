@@ -1,9 +1,0 @@
-{
-  "profile": "openai",
-  "env": {
-    "OPENAI_BASE_URL": "https://integrate.api.nvidia.com/v1",
-    "OPENAI_MODEL": "z-ai/glm-5.1",
-    "OPENAI_API_KEY": "nvapi-"
-  },
-  "createdAt": "2026-06-08T12:47:08.842Z"
-}

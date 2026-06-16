@@ -69,7 +69,16 @@ class PolymarketClient:
         self._auth = get_auth()
 
     def _import_clob_sdk(self):
-        """Import the installed Polymarket CLOB SDK, supporting both package names."""
+        """Import the installed Polymarket CLOB SDK.
+
+        Prefer py_clob_client_v2 (CLOBV2, current) and only fall back to the
+        legacy py_clob_client when v2 is genuinely absent. The legacy client is
+        deprecated by Polymarket and signs orders the server now rejects with
+        "invalid order version", so falling back silently is dangerous. We
+        therefore (a) record the real v2 import failure and (b) warn loudly
+        whenever we end up on the legacy client.
+        """
+        v2_import_error = None
         try:
             from py_clob_client_v2 import (
                 ApiCreds,
@@ -81,7 +90,25 @@ class PolymarketClient:
                 PartialCreateOrderOptions,
             )
             from py_clob_client_v2.constants import POLYGON
-        except ImportError:
+
+            return {
+                "ApiCreds": ApiCreds,
+                "AssetType": AssetType,
+                "BalanceAllowanceParams": BalanceAllowanceParams,
+                "ClobClient": ClobClient,
+                "OrderArgs": OrderArgs,
+                "OrderType": OrderType,
+                "PartialCreateOrderOptions": PartialCreateOrderOptions,
+                "POLYGON": POLYGON,
+                "_using_v2": True,
+            }
+        except ImportError as exc:
+            # v2 is missing OR one of its deps failed to import (e.g. a broken
+            # pydantic_core wheel). Capture the cause so we can surface it.
+            v2_import_error = exc
+
+        # Legacy fallback — deprecated, orders will be rejected server-side.
+        try:
             from py_clob_client import (
                 ApiCreds,
                 AssetType,
@@ -90,8 +117,20 @@ class PolymarketClient:
                 OrderArgs,
                 OrderType,
             )
-            PartialCreateOrderOptions = None
             from py_clob_client.constants import POLYGON
+        except ImportError:
+            # Neither SDK available — re-raise the v2 error, which is the one
+            # the user actually wants to fix to get the working client.
+            raise v2_import_error
+
+        cause = ""
+        if v2_import_error is not None:
+            cause = f" (v2 import failed: {v2_import_error})"
+        print(
+            "⚠️  WARNING: falling back to deprecated py_clob_client. Orders will "
+            f"likely be rejected with 'invalid order version'.{cause}\n"
+            "    Fix: pip install --force-reinstall pydantic_core py-clob-client-v2"
+        )
 
         return {
             "ApiCreds": ApiCreds,
@@ -100,8 +139,9 @@ class PolymarketClient:
             "ClobClient": ClobClient,
             "OrderArgs": OrderArgs,
             "OrderType": OrderType,
-            "PartialCreateOrderOptions": PartialCreateOrderOptions,
+            "PartialCreateOrderOptions": None,
             "POLYGON": POLYGON,
+            "_using_v2": False,
         }
 
     def _get_api_creds(self, sdk: Dict):
@@ -173,6 +213,24 @@ class PolymarketClient:
             return clob_client.post_order(signed_order, order_type, post_only=False)
         except TypeError:
             return clob_client.post_order(signed_order, orderType=order_type, post_only=False)
+
+    @staticmethod
+    def _create_and_post_order_compat(clob_client, order_args, options_cls, order_type):
+        """Sign + submit an order in one call, adapting to the active SDK.
+
+        - v2 SDK: create_and_post_order(order_args, options, order_type, post_only)
+                  bundles signing and posting and internally re-signs when the
+                  server reports an order-version change.
+        - v1 SDK: create_and_post_order(order_args, options) — no order_type arg.
+        """
+        options = options_cls() if options_cls is not None else None
+        try:
+            return clob_client.create_and_post_order(
+                order_args, options, order_type, False
+            )
+        except TypeError:
+            # Legacy v1 SDK signature: (order_args, options)
+            return clob_client.create_and_post_order(order_args, options)
     
     def _rate_limit_check(self):
         """
@@ -1175,13 +1233,17 @@ class PolymarketClient:
         # ─────────────────────────────────────────────────────────────────────
         # USE OFFICIAL py-clob-client FOR ORDER CREATION AND SUBMISSION
         # ─────────────────────────────────────────────────────────────────────
+        # We use create_and_post_order, which signs AND submits in one call.
+        # For the v2 SDK this is important: it internally retries when the server
+        # reports an order-version change (re-signing with the updated version),
+        # which the previous split create_order() + post_order() flow could not do.
         try:
             sdk = self._import_clob_sdk()
             clob_client = self._build_clob_client(sdk)
             OrderArgs = sdk["OrderArgs"]
             OrderType = sdk["OrderType"]
             PartialCreateOrderOptions = sdk["PartialCreateOrderOptions"]
-            
+
             # Log order details before submission
             if config.VERBOSE_LOGGING:
                 print(f"📤 Submitting order via py-clob-client:")
@@ -1190,7 +1252,7 @@ class PolymarketClient:
                 print(f"   Amount: ${amount_usd:.2f}")
                 print(f"   Price: {order_price:.4f}")
                 print(f"   Shares: {shares:.2f}")
-            
+
             # Create the order using the official client
             # V2 SDK: OrderArgs has extra fields (builder_code, user_usdc_balance)
             # Pass PartialCreateOrderOptions so the SDK resolves tick_size/neg_risk
@@ -1201,26 +1263,25 @@ class PolymarketClient:
                 token_id=token_id,
             )
 
-            # Create and sign the order
-            if PartialCreateOrderOptions is not None:
-                signed_order = clob_client.create_order(
-                    order_args, PartialCreateOrderOptions()
-                )
-            else:
-                signed_order = clob_client.create_order(order_args)
-            
-            # Post the order to the CLOB with retry logic for network timeouts
+            # create_and_post_order signs + submits + (v2) recovers from an
+            # order-version flip, all in one call. Retry the whole thing for
+            # network timeouts; renew credentials once on a 401.
             result = None
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    result = self._post_order_compat(clob_client, signed_order, OrderType.GTC)
+                    result = self._create_and_post_order_compat(
+                        clob_client,
+                        order_args,
+                        PartialCreateOrderOptions,
+                        OrderType.GTC,
+                    )
                     break  # Success, exit retry loop
                 except Exception as retry_error:
                     error_str = str(retry_error).lower()
                     is_timeout = "timeout" in error_str or "readtimeout" in error_str or "request exception" in error_str
                     is_unauthorized = self._is_unauthorized_error(retry_error)
-                    
+
                     if is_timeout and attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
                         print(f"⚠️ Order submission timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
@@ -1231,7 +1292,7 @@ class PolymarketClient:
                         clob_client = self._build_clob_client(sdk, fresh_creds)
                     else:
                         raise  # Re-raise if not a timeout or last attempt
-            
+
             if config.VERBOSE_LOGGING:
                 print(f"📥 Order response: {result}")
             

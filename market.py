@@ -2481,6 +2481,8 @@ class PolymarketClient:
             "cash_pnl": float(data.get("cashPnl") or 0),
             "percent_pnl": float(data.get("percentPnl") or 0),
             "redeemable": data.get("redeemable", False),
+            "negative_risk": data.get("negativeRisk", False),
+            "outcome_index": data.get("outcomeIndex"),
             "end_date": data.get("endDate"),
             "raw": data  # Keep raw data for debugging
         }
@@ -2655,6 +2657,7 @@ class PolymarketClient:
         current_shares = position.get("size", 0)
         cur_price = position.get("current_price", 0)
         condition_id = position.get("condition_id") or position.get("market_id")
+        negative_risk = position.get("negative_risk", False)
         
         # If current price is 0.0, it's a losing position (no redemption needed)
         if cur_price == 0:
@@ -2675,7 +2678,7 @@ class PolymarketClient:
             if condition_id:
                 for attempt in range(max_retries):
                     try:
-                        result = self._execute_onchain_redemption(condition_id, token_id, current_shares)
+                        result = self._execute_onchain_redemption(condition_id, token_id, current_shares, negative_risk)
                         if result and result.get("success"):
                             return result
                         if attempt < max_retries - 1:
@@ -2712,14 +2715,18 @@ class PolymarketClient:
         self, 
         condition_id: str, 
         token_id: str,
-        shares: float
+        shares: float,
+        negative_risk: bool = False
     ) -> Optional[Dict]:
         """
-        Execute on-chain redemption via the CTF contract.
+        Execute on-chain redemption via the CTF contract or NegRiskAdapter.
         
-        Tries multiple collateral addresses (pUSD, legacy USDC.e, CTF adapter,
-        neg-risk adapter) because different markets use different collateral
-        backings and the CTF contract requires an exact match.
+        For standard markets: calls CTF.redeemPositions(collateralToken, parentCollectionId,
+        conditionId, indexSets) trying multiple collateral addresses.
+        
+        For neg-risk markets (e.g. BTC Up/Down): calls NegRiskAdapter.redeemPositions(
+        conditionId, amounts) which has a different signature — the collateral is baked
+        into the adapter contract.
         
         After a successful redeem, auto-wraps any USDC.e balance into pUSD
         so the CLOB trading balance stays usable.
@@ -2737,21 +2744,30 @@ class PolymarketClient:
             from web3.middleware import ExtraDataToPOAMiddleware
 
             # Contract addresses (Polygon Mainnet)
+            # Per py-clob-client config.py, USDC.e is the actual collateral for
+            # both standard and neg-risk markets on Polygon mainnet (137).
             CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
             USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
             PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
             CTF_ADAPTER_ADDRESS = "0x7725dc8a1c293e2e9A3C6195ee7e6A3E8eE0926B"
-            NEG_RISK_ADAPTER_ADDRESS = "0x49Fbb73e24DC3FC54CD516aB5BBE387c10F53EBA"
+            LEGACY_NEG_RISK_ADAPTER = "0x49Fbb73e24DC3FC54CD516aB5BBE387c10F53EBA"
 
-            # Collateral candidates the CTF contract may recognise
+            # Collateral candidates the CTF contract may recognise.
+            # ORDER MATTERS: USDC.e is the real backing collateral for Polymarket
+            # positions, so it must come first. Calling redeemPositions with the
+            # wrong collateral does NOT revert — it silently pays out 0 and burns
+            # nothing while returning status 1, so a wrong-collateral tx looks
+            # "successful" unless we verify the actual token burn afterwards.
             collateral_options = [
+                ("USDC.e", USDCE_ADDRESS),
                 ("pUSD", PUSD_ADDRESS),
-                ("legacy USDC.e", USDCE_ADDRESS),
                 ("CTF adapter", CTF_ADAPTER_ADDRESS),
-                ("neg-risk adapter", NEG_RISK_ADAPTER_ADDRESS),
+                ("legacy neg-risk adapter", LEGACY_NEG_RISK_ADAPTER),
             ]
 
             # CTF redeemPositions ABI
+            # signature: redeemPositions(address collateralToken, bytes32 parentCollectionId,
+            #                             bytes32 conditionId, uint256[] indexSets)
             CTF_ABI = [
                 {
                     "inputs": [
@@ -2766,7 +2782,7 @@ class PolymarketClient:
                     "type": "function"
                 }
             ]
-            
+
             # Get wallet credentials
             private_key = config.WALLET_PRIVATE_KEY
             wallet_address = config.WALLET_ADDRESS
@@ -2782,7 +2798,7 @@ class PolymarketClient:
             
             wallet_address = web3.to_checksum_address(wallet_address)
             
-            # Create CTF contract instance
+            # Create contract instance for CTF redemption
             ctf_contract = web3.eth.contract(
                 address=web3.to_checksum_address(CTF_ADDRESS),
                 abi=CTF_ABI
@@ -2802,37 +2818,52 @@ class PolymarketClient:
             index_sets = [1, 2]
 
             # ── Pre-flight: check CTF token balance ───────────────────
-            erc20_balance_abi = [
+            # CTF is an ERC1155 contract, so balanceOf takes (address, uint256 tokenId).
+            # Using the ERC20 signature balanceOf(address) reverts on-chain, which
+            # would silently abort the whole redemption before it even starts.
+            erc1155_balance_abi = [
                 {
-                    "constant": True,
-                    "inputs": [{"name": "_owner", "type": "address"}],
+                    "inputs": [
+                        {"name": "account", "type": "address"},
+                        {"name": "id", "type": "uint256"},
+                    ],
                     "name": "balanceOf",
-                    "outputs": [{"name": "balance", "type": "uint256"}],
+                    "outputs": [{"name": "", "type": "uint256"}],
+                    "stateMutability": "view",
                     "type": "function",
                 }
             ]
             ctf_token = web3.eth.contract(
                 address=web3.to_checksum_address(CTF_ADDRESS),
-                abi=erc20_balance_abi,
+                abi=erc1155_balance_abi,
             )
-            held = ctf_token.functions.balanceOf(wallet_address).call()
+            token_id_int = int(token_id)
+            held = ctf_token.functions.balanceOf(wallet_address, token_id_int).call()
             if held <= 0:
                 print("   ℹ️ CTF token balance is 0 — position may already be redeemed")
                 return {"success": True, "amount_usdc": 0, "shares_redeemed": 0, "method": "already_redeemed"}
 
-            # Snapshot balance before redeem to verify burn
+            # Snapshot balance before redeem to verify burn.
+            # `held` is the exact on-chain raw balance (6-dec USDC units for
+            # Polymarket), so use it directly rather than the float `shares`
+            # which loses precision (e.g. 259.4978 -> 259497799 vs real 259497875).
             balance_before = held
 
             print(f"   🔗 Executing on-chain redemption...")
             print(f"      Condition ID: {condition_id[:16]}...")
-            print(f"      Shares: {shares:.4f}")
+            print(f"      Shares: {shares:.4f} (on-chain raw: {held})")
             print(f"      CTF tokens held: {balance_before}")
-            
-            # ── Try each collateral address ──────────────────────────
+
+            # ── Redeem via standard CTF.redeemPositions ────────────────
+            # USDC.e is the backing collateral for Polymarket positions (per
+            # py-clob-client config). We try each collateral candidate; the
+            # CTF silently pays out 0 for a wrong collateral (no revert), so
+            # we verify the actual token burn before declaring success.
             last_error = None
+
             for collateral_name, collateral_address in collateral_options:
                 try:
-                    print(f"   🔄 Trying collateral: {collateral_name} ...")
+                    print(f"   🔄 Trying CTF with collateral: {collateral_name} ...")
 
                     tx = ctf_contract.functions.redeemPositions(
                         web3.to_checksum_address(collateral_address),
@@ -2856,8 +2887,6 @@ class PolymarketClient:
                             print(f"      ⚠️ Gas estimation failed ({collateral_name}): {e}")
                         last_error = e
                         continue
-                    # If estimate_gas succeeds but the call would revert,
-                    # it will raise above – catch it per-collateral.
                     
                     # Sign and send transaction
                     signed_tx = web3.eth.account.sign_transaction(tx, private_key)
@@ -2870,11 +2899,21 @@ class PolymarketClient:
                     receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
                     
                     if receipt['status'] == 1:
-                        # Verify tokens were actually burned
-                        balance_after = ctf_token.functions.balanceOf(wallet_address).call()
-                        shares_burned = (balance_before - balance_after) / 1e18 if balance_before > balance_after else shares
+                        balance_after = ctf_token.functions.balanceOf(wallet_address, token_id_int).call()
 
-                        print(f"   ✅ Redemption successful via {collateral_name}!")
+                        # CRITICAL: verify the position was actually burned.
+                        # redeemPositions with the WRONG collateral does NOT
+                        # revert — it returns status 1 but pays out 0 and burns
+                        # nothing. Only treat it as success if tokens were burned.
+                        if balance_after >= balance_before:
+                            if config.VERBOSE_LOGGING:
+                                print(f"      ⚠️ {collateral_name}: tx succeeded but 0 tokens burned (wrong collateral) — trying next")
+                            last_error = f"{collateral_name}: no tokens burned (wrong collateral)"
+                            continue
+
+                        shares_burned = (balance_before - balance_after) / 1e6
+
+                        print(f"   ✅ Redemption successful via CTF ({collateral_name})!")
                         print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
 
                         result = {
@@ -2887,18 +2926,11 @@ class PolymarketClient:
                             "tx_hash": tx_hash_hex,
                             "gas_used": receipt['gasUsed']
                         }
-                        # Some legacy/adapter-backed redemptions credit USDC.e even
-                        # when the CLOB displays pUSD buying power. Wrap whatever
-                        # USDC.e is present after any successful redeem.
                         wrap_result = self._wrap_legacy_usdce_to_pusd(
-                            web3,
-                            wallet_address,
-                            private_key,
-                            USDCE_ADDRESS,
+                            web3, wallet_address, private_key, USDCE_ADDRESS,
                         )
                         if wrap_result:
                             result.update(wrap_result)
-
                         return result
 
                     print(f"   ❌ Transaction failed (reverted) with {collateral_name}")
@@ -2908,7 +2940,7 @@ class PolymarketClient:
                     print(f"      ⚠️ {collateral_name} redemption failed: {e}")
 
             if last_error:
-                print(f"   ❌ Redemption failed for all collateral options: {last_error}")
+                print(f"   ❌ Redemption failed for all methods: {last_error}")
             return None
                 
         except ImportError:

@@ -32,9 +32,18 @@ class LiveRegressionTests(unittest.TestCase):
         self.original_verbose = config.VERBOSE_LOGGING
         self.original_wallet_address = config.WALLET_ADDRESS
         self.original_edge_price_source = config.EDGE_PRICE_SOURCE
+        self.active_trades_dir = tempfile.TemporaryDirectory()
+        self.active_trades_patch = patch.object(
+            execution,
+            "ACTIVE_TRADES_FILE",
+            os.path.join(self.active_trades_dir.name, "active_trades.json"),
+        )
+        self.active_trades_patch.start()
         config.VERBOSE_LOGGING = False
 
     def tearDown(self):
+        self.active_trades_patch.stop()
+        self.active_trades_dir.cleanup()
         config.TEST_MODE = self.original_test_mode
         config.VERBOSE_LOGGING = self.original_verbose
         config.WALLET_ADDRESS = self.original_wallet_address
@@ -115,6 +124,44 @@ class LiveRegressionTests(unittest.TestCase):
         self.assertIn(trade.trade_id, engine.state.active_trades)
         self.assertEqual(engine.state.resolved_balance, 100.0)
         self.assertEqual(engine.state.losses, 0)
+
+    def test_live_win_books_redeemed_amount_not_odds_estimate(self):
+        config.TEST_MODE = False
+        client = FakeExecutionClient(balance=81.0)
+        engine = ExecutionEngine(client)
+        engine.state.resolved_balance = 100.0
+        engine.state.daily_pnl = 0.0
+
+        trade = self._sample_trade("market-redeemed")
+        trade.bet_size = 19.0
+        trade.entry_odds = 0.505
+        trade.filled_price = 0.0
+        trade.filled_shares = 35.82
+
+        with patch.object(engine, "_redeem_winning_shares", return_value={
+            "success": True,
+            "amount_usdc": 35.82,
+            "method": "onchain_redemption",
+            "tx_hash": "0xabc",
+        }), patch.object(engine, "_sync_balance_after_resolution"):
+            engine._resolve_trade_with_outcome(trade, "WIN")
+
+        self.assertAlmostEqual(trade.payout, 35.82)
+        self.assertAlmostEqual(trade.payout - trade.bet_size, 16.82)
+        self.assertAlmostEqual(engine.state.resolved_balance, 116.82)
+        self.assertAlmostEqual(engine.state.daily_pnl, 16.82)
+        self.assertEqual(trade.redemption_status, "REDEEMED")
+
+    def test_resolution_sync_accepts_lower_api_balance(self):
+        config.TEST_MODE = False
+        client = FakeExecutionClient(balance=95.0)
+        engine = ExecutionEngine(client)
+        engine.state.balance = 100.0
+
+        with patch("execution.time.sleep"):
+            engine._sync_balance_after_resolution()
+
+        self.assertEqual(engine.state.balance, 95.0)
 
     def test_strategy_skips_clob_fallback_prices(self):
         config.TEST_MODE = True

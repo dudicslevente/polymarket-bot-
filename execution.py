@@ -1224,15 +1224,7 @@ class ExecutionEngine:
         if outcome == "WIN":
             trade.outcome = "WIN"
             trade.status = TradeStatus.RESOLVED_WIN
-            
-            # Calculate payout (bet size / odds = shares, shares * 1 = payout on win)
-            # Payout = bet_size / entry_odds (since we get $1 per share if win)
-            payout = trade.bet_size / trade.entry_odds
-            
-            # Apply fee
-            payout *= (1 - config.ESTIMATED_FEE_PERCENT)
-            
-            trade.payout = payout
+            redemption_result = None
             
             # ════════════════════════════════════════════════════════════════
             # CRITICAL: Redeem winning shares in LIVE mode
@@ -1244,7 +1236,7 @@ class ExecutionEngine:
                 if redemption_result:
                     if not redemption_result.get("needs_manual_redemption"):
                         trade.redemption_status = "REDEEMED"
-                        trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                        trade.redemption_amount = redemption_result.get("amount_usdc", 0.0)
                         trade.redemption_tx_hash = redemption_result.get("tx_hash")
                         trade.redemption_method = redemption_result.get("method")
                         print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} pUSD")
@@ -1256,6 +1248,9 @@ class ExecutionEngine:
                     print(f"⚠️ Redemption may have failed - check Polymarket manually")
                     print(f"   Token ID: {trade.token_id}")
                     print(f"   Shares: {trade.filled_shares}")
+
+            payout = self._get_realized_win_payout(trade, redemption_result)
+            trade.payout = payout
             
             # Update actual balance (for bot's internal tracking)
             self.state.balance += payout
@@ -1435,6 +1430,46 @@ class ExecutionEngine:
                 print(f"⚠️ Fallback resolution check failed: {e}")
         
         return "PENDING"
+
+    def _estimate_win_payout(self, trade: Trade) -> float:
+        """Estimate a winning payout when no live fill/redemption data is available."""
+        if trade.entry_odds > 0:
+            return (trade.bet_size / trade.entry_odds) * (1 - config.ESTIMATED_FEE_PERCENT)
+        if trade.filled_shares and trade.filled_shares > 0:
+            return float(trade.filled_shares)
+        return 0.0
+
+    def _get_realized_win_payout(
+        self,
+        trade: Trade,
+        redemption_result: Optional[Dict[str, Any]] = None
+    ) -> float:
+        """
+        Return the cash payout to book for a winning trade.
+
+        In live mode, resolved shares redeem for $1 each. The old odds-based
+        estimate can overstate P&L when the fill price was reconciled from a
+        position and the true average fill price is unavailable.
+        """
+        if config.TEST_MODE:
+            return self._estimate_win_payout(trade)
+
+        if redemption_result:
+            if redemption_result.get("needs_manual_redemption"):
+                return 0.0
+
+            amount = redemption_result.get("amount_usdc")
+            if amount is not None:
+                try:
+                    return max(0.0, float(amount))
+                except (TypeError, ValueError):
+                    pass
+
+        if trade.filled_shares and trade.filled_shares > 0:
+            return float(trade.filled_shares)
+
+        print("⚠️ Missing live payout data; falling back to estimated odds-based payout")
+        return self._estimate_win_payout(trade)
     
     def _resolve_trade_with_outcome(self, trade: Trade, outcome: str):
         """
@@ -1455,11 +1490,7 @@ class ExecutionEngine:
         if outcome == "WIN":
             trade.outcome = "WIN"
             trade.status = TradeStatus.RESOLVED_WIN
-            
-            # Calculate payout
-            payout = trade.bet_size / trade.entry_odds
-            payout *= (1 - config.ESTIMATED_FEE_PERCENT)
-            trade.payout = payout
+            redemption_result = None
             
             # ════════════════════════════════════════════════════════════════
             # CRITICAL: Redeem winning shares in LIVE mode
@@ -1471,7 +1502,7 @@ class ExecutionEngine:
                 if redemption_result:
                     if not redemption_result.get("needs_manual_redemption"):
                         trade.redemption_status = "REDEEMED"
-                        trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                        trade.redemption_amount = redemption_result.get("amount_usdc", 0.0)
                         trade.redemption_tx_hash = redemption_result.get("tx_hash")
                         trade.redemption_method = redemption_result.get("method")
                         print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} pUSD")
@@ -1483,6 +1514,9 @@ class ExecutionEngine:
                     print(f"⚠️ Redemption may have failed - check Polymarket manually")
                     print(f"   Token ID: {trade.token_id}")
                     print(f"   Shares: {trade.filled_shares}")
+
+            payout = self._get_realized_win_payout(trade, redemption_result)
+            trade.payout = payout
             
             # Update actual balance
             self.state.balance += payout
@@ -1600,12 +1634,11 @@ class ExecutionEngine:
         if new_balance is not None:
             old_balance = self.state.balance
             
-            # If API balance is higher than our tracking, use API balance
-            # (This catches any redemption amounts we might have missed)
-            if new_balance > self.state.balance:
+            # Wallet balance is the live source of truth after redemption.
+            if abs(new_balance - self.state.balance) > 0.01:
                 self.state.balance = new_balance
                 diff = new_balance - old_balance
-                print(f"💰 Balance synced from API: ${old_balance:.2f} → ${new_balance:.2f} (+${diff:.2f})")
+                print(f"💰 Balance synced from API: ${old_balance:.2f} → ${new_balance:.2f} ({diff:+.2f})")
             elif config.VERBOSE_LOGGING:
                 print(f"💰 Balance verified: ${new_balance:.2f}")
         else:

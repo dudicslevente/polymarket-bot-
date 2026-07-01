@@ -89,14 +89,20 @@ class PolymarketAuth:
         wallet_address = config.WALLET_ADDRESS or ""
         private_key = config.WALLET_PRIVATE_KEY or ""
 
-        # In live mode, prefer deriving fresh API credentials from the wallet.
-        # This avoids stale or revoked API keys in .env causing 401 failures.
-        if wallet_address and private_key:
+        # In live mode, derive API credentials only when .env does not already
+        # provide a complete set. Runtime CLOB calls still re-derive on 401, so
+        # stale credentials recover without making startup/mock tests hit the
+        # network unnecessarily.
+        if wallet_address and private_key and not (api_key and api_secret and passphrase):
             try:
                 try:
                     from py_clob_client_v2 import ClobClient
-                except ImportError:
-                    from py_clob_client import ClobClient
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "py_clob_client_v2 is required for LIVE trading. "
+                        "Fix: pip install --force-reinstall pydantic_core "
+                        "py-clob-client-v2"
+                    ) from exc
 
                 if (
                     config.POLYMARKET_SIGNATURE_TYPE == 3

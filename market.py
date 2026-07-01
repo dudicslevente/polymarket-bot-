@@ -184,6 +184,7 @@ class PolymarketClient:
                 AssetType,
                 BalanceAllowanceParams,
                 ClobClient,
+                OpenOrderParams,
                 OrderArgs,
                 OrderType,
                 PartialCreateOrderOptions,
@@ -195,6 +196,7 @@ class PolymarketClient:
                 "AssetType": AssetType,
                 "BalanceAllowanceParams": BalanceAllowanceParams,
                 "ClobClient": ClobClient,
+                "OpenOrderParams": OpenOrderParams,
                 "OrderArgs": OrderArgs,
                 "OrderType": OrderType,
                 "PartialCreateOrderOptions": PartialCreateOrderOptions,
@@ -206,13 +208,22 @@ class PolymarketClient:
             # pydantic_core wheel). Capture the cause so we can surface it.
             v2_import_error = exc
 
+        if not config.TEST_MODE:
+            raise ImportError(
+                "py_clob_client_v2 is required for LIVE trading; "
+                f"v2 import failed: {v2_import_error}. "
+                "Fix: pip install --force-reinstall pydantic_core py-clob-client-v2"
+            )
+
         # Legacy fallback — deprecated, orders will be rejected server-side.
+        # Only permitted in TEST_MODE for compatibility with older local tools.
         try:
             from py_clob_client import (
                 ApiCreds,
                 AssetType,
                 BalanceAllowanceParams,
                 ClobClient,
+                OpenOrderParams,
                 OrderArgs,
                 OrderType,
             )
@@ -236,6 +247,7 @@ class PolymarketClient:
             "AssetType": AssetType,
             "BalanceAllowanceParams": BalanceAllowanceParams,
             "ClobClient": ClobClient,
+            "OpenOrderParams": OpenOrderParams,
             "OrderArgs": OrderArgs,
             "OrderType": OrderType,
             "PartialCreateOrderOptions": None,
@@ -306,6 +318,24 @@ class PolymarketClient:
         return "401" in text or "unauthorized" in text
 
     @staticmethod
+    def _is_transient_balance_error(error: Exception) -> bool:
+        """Detect transient network errors worth retrying (connection resets, timeouts, 5xx).
+
+        Covers raw requests ConnectionError/Timeout, PolyApiException wrapping a
+        network failure (status_code=None with a 'request exception' message, e.g.
+        "Connection reset by peer"), and transient HTTP codes (408/429/5xx).
+        """
+        if isinstance(error, (requests.exceptions.ConnectionError,
+                              requests.exceptions.Timeout)):
+            return True
+        status = getattr(error, "status_code", None)
+        if status is None:
+            text = str(error).lower()
+            return any(k in text for k in (
+                "request exception", "connection", "reset", "timeout", "timed out"))
+        return status in (408, 429, 500, 502, 503, 504)
+
+    @staticmethod
     def _post_order_compat(clob_client, signed_order, order_type):
         """Call post_order with correct API for v2 SDK (positional) or v1 SDK (keyword)."""
         try:
@@ -330,6 +360,125 @@ class PolymarketClient:
         except TypeError:
             # Legacy v1 SDK signature: (order_args, options)
             return clob_client.create_and_post_order(order_args, options)
+
+    def _get_open_orders_for_token_compat(self, clob_client, sdk: Dict, token_id: str) -> List[Dict]:
+        """Return open orders for a token using either CLOB SDK generation."""
+        params_cls = sdk.get("OpenOrderParams")
+        if params_cls is None:
+            return []
+
+        params = params_cls(asset_id=str(token_id))
+        try:
+            if hasattr(clob_client, "get_open_orders"):
+                return clob_client.get_open_orders(params, only_first_page=True) or []
+            if hasattr(clob_client, "get_orders"):
+                return clob_client.get_orders(params) or []
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Could not reconcile open orders after timeout: {e}")
+        return []
+
+    def get_open_orders_for_token(self, token_id: str) -> List[Dict]:
+        """Fetch current open orders for a token using the configured CLOB SDK."""
+        if config.TEST_MODE:
+            return []
+        if not self._auth.is_ready(AuthLevel.L2):
+            return []
+        try:
+            sdk = self._import_clob_sdk()
+            clob_client = self._build_clob_client(sdk)
+            return self._get_open_orders_for_token_compat(clob_client, sdk, token_id)
+        except Exception as e:
+            if config.VERBOSE_LOGGING:
+                print(f"⚠️ Could not fetch open orders for token {token_id[:16]}...: {e}")
+            return []
+
+    def _reconcile_order_submission_timeout(
+        self,
+        clob_client,
+        sdk: Dict,
+        token_id: str,
+        amount_usd: float,
+        order_price: float,
+        shares: float,
+    ) -> Dict:
+        """
+        Reconcile an ambiguous order-submission timeout without resubmitting.
+
+        A timeout after create_and_post_order is dangerous: the server may have
+        accepted the order even though the client did not receive the response.
+        Blindly retrying can create a second BUY. Instead, look for evidence of
+        a fill or an open order and otherwise return an explicit unconfirmed
+        failure so the caller does not double-enter.
+        """
+        print("⚠️ Order submission timed out after signing/posting.")
+        print("   Not retrying automatically; checking for fill/open order first.")
+
+        filled = self._check_position_for_fill(token_id, retries=5, delay_seconds=3.0)
+        if filled:
+            filled_shares = float(filled.get("size", 0.0) or 0.0)
+            filled_price = float(filled.get("avg_price", 0.0) or order_price)
+            print("✅ Position appeared after timeout; treating order as filled.")
+            return {
+                "success": True,
+                "order_id": None,
+                "status": "FILLED_VIA_POSITION_POST_TIMEOUT",
+                "amount_usd": amount_usd,
+                "price": filled_price,
+                "shares": filled_shares or shares,
+                "filled_price": filled_price,
+                "filled_shares": filled_shares or shares,
+                "raw_response": {"reconciled_after_timeout": True, "position": filled},
+            }
+
+        trade_found = self._check_trades_for_fill(token_id)
+        if trade_found:
+            filled_shares = float(trade_found.get("size", 0.0) or 0.0)
+            filled_price = float(trade_found.get("price", 0.0) or order_price)
+            print("✅ Trade appeared after timeout; treating order as filled.")
+            return {
+                "success": True,
+                "order_id": None,
+                "status": "FILLED_VIA_TRADES_POST_TIMEOUT",
+                "amount_usd": amount_usd,
+                "price": filled_price,
+                "shares": filled_shares or shares,
+                "filled_price": filled_price,
+                "filled_shares": filled_shares or shares,
+                "raw_response": {"reconciled_after_timeout": True, "trade": trade_found},
+            }
+
+        open_orders = self._get_open_orders_for_token_compat(clob_client, sdk, token_id)
+        if open_orders:
+            order = open_orders[0]
+            order_id = (
+                order.get("id")
+                or order.get("orderID")
+                or order.get("order_id")
+                or order.get("orderId")
+            )
+            status = order.get("status") or order.get("orderStatus") or "OPEN"
+            print("ℹ️ Found an open order after timeout; will monitor it instead of reposting.")
+            return {
+                "success": True,
+                "order_id": order_id,
+                "status": f"{str(status).upper()}_POST_TIMEOUT",
+                "amount_usd": amount_usd,
+                "price": order_price,
+                "shares": shares,
+                "raw_response": {"reconciled_after_timeout": True, "open_order": order},
+            }
+
+        print("⚠️ Could not confirm whether the timed-out order was accepted.")
+        print("   Skipping automatic retry to avoid duplicate exposure.")
+        return {
+            "success": False,
+            "status": "SUBMISSION_TIMEOUT_UNCONFIRMED",
+            "error": (
+                "Order submission timed out and no fill/open order was found. "
+                "Not resubmitted to avoid duplicate exposure."
+            ),
+        }
     
     def _rate_limit_check(self):
         """
@@ -1363,34 +1512,42 @@ class PolymarketClient:
             )
 
             # create_and_post_order signs + submits + (v2) recovers from an
-            # order-version flip, all in one call. Retry the whole thing for
-            # network timeouts; renew credentials once on a 401.
+            # order-version flip, all in one call. Do NOT retry after an
+            # ambiguous network timeout: the server may have accepted the
+            # first BUY. Renew credentials once on a 401, which is safe.
             result = None
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
+            try:
+                result = self._create_and_post_order_compat(
+                    clob_client,
+                    order_args,
+                    PartialCreateOrderOptions,
+                    OrderType.GTC,
+                )
+            except Exception as submit_error:
+                error_str = str(submit_error).lower()
+                is_timeout = (
+                    "timeout" in error_str
+                    or "readtimeout" in error_str
+                    or "request exception" in error_str
+                )
+                is_unauthorized = self._is_unauthorized_error(submit_error)
+
+                if is_unauthorized:
+                    print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
+                    fresh_creds = self._derive_fresh_api_creds(sdk)
+                    clob_client = self._build_clob_client(sdk, fresh_creds)
                     result = self._create_and_post_order_compat(
                         clob_client,
                         order_args,
                         PartialCreateOrderOptions,
                         OrderType.GTC,
                     )
-                    break  # Success, exit retry loop
-                except Exception as retry_error:
-                    error_str = str(retry_error).lower()
-                    is_timeout = "timeout" in error_str or "readtimeout" in error_str or "request exception" in error_str
-                    is_unauthorized = self._is_unauthorized_error(retry_error)
-
-                    if is_timeout and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
-                        print(f"⚠️ Order submission timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                    elif is_unauthorized and attempt == 0:
-                        print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
-                        fresh_creds = self._derive_fresh_api_creds(sdk)
-                        clob_client = self._build_clob_client(sdk, fresh_creds)
-                    else:
-                        raise  # Re-raise if not a timeout or last attempt
+                elif is_timeout:
+                    return self._reconcile_order_submission_timeout(
+                        clob_client, sdk, token_id, amount_usd, order_price, shares
+                    )
+                else:
+                    raise
 
             if config.VERBOSE_LOGGING:
                 print(f"📥 Order response: {result}")
@@ -2171,40 +2328,56 @@ class PolymarketClient:
             print("❌ Cannot fetch balance: Authentication not configured (L2 required)")
             return None
         
-        try:
-            sdk = self._import_clob_sdk()
-            params = sdk["BalanceAllowanceParams"](
-                asset_type=sdk["AssetType"].COLLATERAL,
-                signature_type=config.POLYMARKET_SIGNATURE_TYPE,
-            )
-            clob_client = self._build_clob_client(sdk)
+        max_retries = 3
+        sdk = None
+        params = None
+        result = None
 
+        for attempt in range(max_retries):
             try:
-                result = clob_client.get_balance_allowance(params)
-            except Exception as first_error:
-                if not self._is_unauthorized_error(first_error):
-                    raise
-                print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
-                fresh_creds = self._derive_fresh_api_creds(sdk)
-                clob_client = self._build_clob_client(sdk, fresh_creds)
-                result = clob_client.get_balance_allowance(params)
-            
-            if result is None:
-                print("❌ Failed to fetch balance from API")
+                if sdk is None:
+                    sdk = self._import_clob_sdk()
+                    params = sdk["BalanceAllowanceParams"](
+                        asset_type=sdk["AssetType"].COLLATERAL,
+                        signature_type=config.POLYMARKET_SIGNATURE_TYPE,
+                    )
+                clob_client = self._build_clob_client(sdk)
+
+                try:
+                    result = clob_client.get_balance_allowance(params)
+                except Exception as first_error:
+                    if not self._is_unauthorized_error(first_error):
+                        raise
+                    # Re-derive credentials only on a 401, not on a transient
+                    # network failure (avoids needless re-derivation on a reset).
+                    print("⚠️ Stored API credentials were rejected; deriving fresh credentials...")
+                    fresh_creds = self._derive_fresh_api_creds(sdk)
+                    clob_client = self._build_clob_client(sdk, fresh_creds)
+                    result = clob_client.get_balance_allowance(params)
+                break  # success
+
+            except Exception as e:
+                if self._is_transient_balance_error(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
+                    print(f"⚠️ Balance fetch hit transient network error (attempt {attempt + 1}/{max_retries}), "
+                          f"retrying in {wait_time}s... ({e})")
+                    time.sleep(wait_time)
+                    continue
+                print(f"❌ Error fetching balance: {e}")
                 return None
-            
-            # Parse the balance response
-            # The API may return balance in different formats
-            balance = self._parse_balance_response(result)
-            
-            if balance is not None and config.VERBOSE_LOGGING:
-                print(f"💰 USDC Balance: ${balance:.2f}")
-            
-            return balance
-            
-        except Exception as e:
-            print(f"❌ Error fetching balance: {e}")
+
+        if result is None:
+            print("❌ Failed to fetch balance from API")
             return None
+
+        # Parse the balance response
+        # The API may return balance in different formats
+        balance = self._parse_balance_response(result)
+
+        if balance is not None and config.VERBOSE_LOGGING:
+            print(f"💰 USDC Balance: ${balance:.2f}")
+
+        return balance
     
     def _parse_balance_response(self, response: Dict) -> Optional[float]:
         """
@@ -2361,21 +2534,30 @@ class PolymarketClient:
     # POSITION TRACKING METHODS (LIVE MODE)
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    def get_open_positions(self) -> Optional[List[Dict]]:
+    def get_open_positions(self, for_redemption: bool = False) -> Optional[List[Dict]]:
         """
         Get all open positions for the user.
-        
+
         This retrieves all tokens/shares currently held in the account,
         including unredeemed winning positions.
-        
+
         NOTE: Uses the Polymarket data-api for positions (not CLOB API).
         The data-api provides comprehensive position data including
         P&L, redeemable status, and market metadata.
-        
+
+        Args:
+            for_redemption: When True, the response MUST contain current_price
+                and redeemable flags to identify winners. On transient data-api
+                failure we return None instead of falling back to the trade-history
+                reconstruction (which lacks those fields and would cause the
+                redemption sweep to classify every position — winners included —
+                as a 0-price loss and silently skip them). Leave False for
+                informational lookups where the fallback is acceptable.
+
         Returns:
             List of position dicts with token_id, size, market info, etc.
             Returns None on error, empty list if no positions.
-            
+
         Example:
             >>> positions = client.get_open_positions()
             >>> for pos in positions:
@@ -2383,38 +2565,109 @@ class PolymarketClient:
         """
         if config.TEST_MODE:
             return []
-        
+
         if not self._auth.is_ready(AuthLevel.L1):
             print("❌ Cannot fetch positions: Authentication not configured")
             return None
-        
-        try:
-            # Use Polymarket data-api for positions - this is the correct endpoint
-            # The CLOB API does NOT have a /positions endpoint
-            account_addresses = self._account_addresses_for_data_api()
-            if not account_addresses:
-                print("❌ WALLET_ADDRESS/POLYMARKET_FUNDER_ADDRESS not configured")
-                return None
-            
-            # Data API endpoint for user positions
-            data_api_url = "https://data-api.polymarket.com"
-            url = f"{data_api_url}/positions"
-            seen_tokens = set()
-            positions = []
 
-            for account_address in account_addresses:
-                params = {"user": account_address}
-                
-                response = requests.get(url, params=params, timeout=30)
-                response.raise_for_status()
-                result = response.json()
-                
+        # Use Polymarket data-api for positions - this is the correct endpoint
+        # The CLOB API does NOT have a /positions endpoint
+        account_addresses = self._account_addresses_for_data_api()
+        if not account_addresses:
+            print("❌ WALLET_ADDRESS/POLYMARKET_FUNDER_ADDRESS not configured")
+            return None
+
+        # Data API endpoint for user positions
+        data_api_url = "https://data-api.polymarket.com"
+        url = f"{data_api_url}/positions"
+
+        # Transient errors worth retrying before giving up. 408/429/5xx are
+        # explicitly temporary; Timeout/ConnectionError likewise. These are the
+        # failures that previously caused silent stranding: one timeout dropped
+        # straight into the trade-history fallback, which has no price data.
+        def _is_transient(resp_or_exc) -> bool:
+            status = getattr(resp_or_exc, "status_code", None)
+            if status is not None:
+                return status in (408, 429, 500, 502, 503, 504)
+            return isinstance(resp_or_exc, (requests.exceptions.Timeout,
+                                            requests.exceptions.ConnectionError))
+
+        max_retries = 3
+        seen_tokens = set()
+        positions = []
+        last_error = None
+
+        # Each account address is fetched with retries-with-backoff. If ANY
+        # address fails transiently after all retries, the whole call is
+        # treated as failed — partial position sets are misleading.
+        for account_address in account_addresses:
+            # The data-api caps a single response at 100 positions. Without
+            # paginating, accounts with >100 positions silently drop the
+            # overflow (e.g. a real winner sitting beyond position #100).
+            page_size = 100
+            offset = 0
+            while True:
+                params = {"user": account_address, "limit": page_size, "offset": offset}
+                result = None
+                success = False
+
+                for attempt in range(max_retries):
+                    try:
+                        response = requests.get(url, params=params, timeout=12)
+                        if _is_transient(response):
+                            last_error = f"HTTP {response.status_code}"
+                            if attempt < max_retries - 1:
+                                wait_time = (attempt + 1) * 2  # 2s, 4s exponential backoff
+                                print(f"⚠️ Data API transient error {response.status_code} for {account_address[:10]}... "
+                                      f"(attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                                time.sleep(wait_time)
+                                continue
+                            response.raise_for_status()  # final attempt: surface the error
+                        response.raise_for_status()
+                        result = response.json()
+                        success = True
+                        break
+
+                    except (requests.exceptions.Timeout,
+                            requests.exceptions.ConnectionError) as e:
+                        last_error = type(e).__name__
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 2  # 2s, 4s
+                            print(f"⚠️ Data API {type(e).__name__} for {account_address[:10]}... "
+                                  f"(attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                        break
+                    except requests.exceptions.HTTPError as e:
+                        last_error = f"HTTP {response.status_code}"
+                        if _is_transient(response) and attempt < max_retries - 1:
+                            # Already retried via the transient branch above; this
+                            # path covers raise_for_status on a transient final attempt.
+                            wait_time = (attempt + 1) * 2
+                            print(f"⚠️ Data API transient HTTP {response.status_code} for {account_address[:10]}... "
+                                  f"(attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                        break
+
+                if not success or result is None:
+                    # Transient failure exhausted all retries.
+                    print(f"⚠️ Data API positions endpoint failed after {max_retries} attempts ({last_error}).")
+                    if for_redemption:
+                        # Do NOT fall back: the trade-history reconstruction lacks
+                        # current_price/redeemable, so a redemption sweep against it
+                        # would treat every real winner as a loss and skip it.
+                        print("   Skipping redemption cycle — refusing to sweep without price data.")
+                        return None
+                    # Informational callers tolerate the lossy fallback.
+                    return self._get_positions_from_trades()
+
                 raw_items = []
                 if isinstance(result, list):
                     raw_items = result
                 elif isinstance(result, dict) and "positions" in result:
                     raw_items = result["positions"]
-                
+
                 for item in raw_items:
                     if not isinstance(item, dict):
                         continue
@@ -2427,32 +2680,28 @@ class PolymarketClient:
                         continue
                     seen_tokens.add(token_id)
                     positions.append(parsed)
-            
-            if config.VERBOSE_LOGGING:
-                if positions:
-                    print(f"📋 Found {len(positions)} open positions")
-                    # Count winning vs losing positions based on current_price
-                    winning = [p for p in positions if p.get("current_price", 0) >= 0.90]
-                    losing = [p for p in positions if p.get("current_price", 0) < 0.10]
-                    pending = [p for p in positions if 0.10 <= p.get("current_price", 0) < 0.90]
-                    if winning:
-                        print(f"   💰 {len(winning)} WINNING positions to redeem!")
-                    if losing:
-                        print(f"   ❌ {len(losing)} LOSING positions (no value)")
-                    if pending:
-                        print(f"   ⏳ {len(pending)} positions still pending")
-                else:
-                    print("ℹ️ No open positions found")
-            
-            return positions
-            
-        except requests.exceptions.HTTPError as e:
-            # Try alternate method if data-api fails
-            print(f"⚠️ Data API positions endpoint error: {e}")
-            return self._get_positions_from_trades()
-        except Exception as e:
-            print(f"❌ Error fetching positions: {e}")
-            return self._get_positions_from_trades()
+
+                # Advance to the next page. Stop when a page is shorter than
+                # the requested page size (last page) or empty.
+                if len(raw_items) < page_size:
+                    break
+                offset += page_size
+
+        if config.VERBOSE_LOGGING:
+            if positions:
+                print(f"📋 Found {len(positions)} open positions")
+                # Classify by the same signal the redemption sweep uses:
+                # redeemable AND current_value > 0.01 = winner (null-price safe).
+                winning = [p for p in positions if p.get("redeemable") is True and p.get("current_value", 0) > 0.01]
+                losing = [p for p in positions if not (p.get("redeemable") is True and p.get("current_value", 0) > 0.01)]
+                if winning:
+                    print(f"   💰 {len(winning)} WINNING positions to redeem!")
+                if losing:
+                    print(f"   ❌ {len(losing)} other positions (losses / unresolved)")
+            else:
+                print("ℹ️ No open positions found")
+
+        return positions
     
     def _parse_data_api_position(self, data: Dict) -> Dict:
         """
@@ -2550,10 +2799,10 @@ class PolymarketClient:
     def _parse_position(self, data: Dict) -> Dict:
         """
         Parse a position from API response into standardized format.
-        
+
         Args:
             data: Raw position data from API
-            
+
         Returns:
             Standardized position dict
         """
@@ -2562,10 +2811,15 @@ class PolymarketClient:
             "size": float(data.get("size") or data.get("shares") or data.get("balance") or 0),
             "avg_price": float(data.get("avg_price") or data.get("avgPrice") or data.get("average_price") or 0),
             "current_price": float(data.get("current_price") or data.get("curPrice") or 0),
+            "current_value": float(data.get("current_value") or data.get("currentValue") or 0),
             "market_id": data.get("market_id") or data.get("marketId") or data.get("condition_id") or data.get("conditionId"),
             "condition_id": data.get("condition_id") or data.get("conditionId") or data.get("market_id"),
             "side": data.get("side") or data.get("outcome"),
+            "title": data.get("title"),
             "unrealized_pnl": float(data.get("unrealized_pnl") or data.get("unrealizedPnl") or 0),
+            "redeemable": data.get("redeemable", False),
+            "negative_risk": data.get("negative_risk") if data.get("negative_risk") is not None else data.get("negativeRisk", False),
+            "outcome_index": data.get("outcome_index") if data.get("outcome_index") is not None else data.get("outcomeIndex"),
             "raw": data  # Keep raw data for debugging
         }
     
@@ -2598,7 +2852,8 @@ class PolymarketClient:
         self, 
         token_id: str,
         shares: Optional[float] = None,
-        max_retries: int = 3
+        max_retries: int = 3,
+        known_position: Optional[Dict] = None,
     ) -> Optional[Dict]:
         """
         Redeem winning shares on-chain via the CTF (Conditional Token Framework) contract.
@@ -2611,6 +2866,9 @@ class PolymarketClient:
             token_id: The token ID of the winning position
             shares: Number of shares to redeem (ignored - all shares are redeemed)
             max_retries: Number of retry attempts on failure
+            known_position: Optional data-api position already fetched by a
+                redemption sweep. Avoids a second positions call that could fail
+                transiently and be mistaken for an already-redeemed position.
             
         Returns:
             Dict with redemption info:
@@ -2638,8 +2896,19 @@ class PolymarketClient:
             print("❌ Cannot redeem: No token ID provided")
             return None
         
-        # Get current position status
-        position = self.get_position_for_token(token_id)
+        # Get current position status. Redemption sweeps pass the already
+        # classified data-api position so we do not refetch and accidentally
+        # turn a transient API failure into "already redeemed".
+        position = known_position
+        if position is None:
+            positions = self.get_open_positions(for_redemption=True)
+            if positions is None:
+                print("⚠️ Cannot confirm position status: positions API unavailable")
+                return None
+            for pos in positions:
+                if pos.get("token_id") == token_id:
+                    position = pos
+                    break
         
         if position is None or position.get("size", 0) == 0:
             # Position is gone - already redeemed or never existed
@@ -2656,10 +2925,106 @@ class PolymarketClient:
         # Position still exists - check if market is resolved
         current_shares = position.get("size", 0)
         cur_price = position.get("current_price", 0)
+        cur_value = position.get("current_value", 0)
         condition_id = position.get("condition_id") or position.get("market_id")
         negative_risk = position.get("negative_risk", False)
-        
-        # If current price is 0.0, it's a losing position (no redemption needed)
+        # outcomeIndex from data-api: 0 = YES, 1 = NO. Needed by the
+        # NegRiskAdapter, whose _amounts[] is parallel to [YES, NO].
+        outcome_index = position.get("outcome_index")
+        redeemable = position.get("redeemable", False)
+        position_owner = position.get("owner")
+        signer_wallet = (config.WALLET_ADDRESS or "").lower()
+        position_owner_normalized = str(position_owner).lower() if position_owner else None
+
+        def _manual_required_for_non_signer_owner(estimated_value: float) -> Optional[Dict]:
+            if not position_owner_normalized or not signer_wallet:
+                return None
+            if position_owner_normalized == signer_wallet:
+                return None
+
+            print("⚠️ Position is held by a different owner than WALLET_ADDRESS")
+            print(f"   Position owner: {position_owner}")
+            print(f"   Signer wallet:  {config.WALLET_ADDRESS}")
+            print("   Automatic direct redemption can only burn tokens held by the signer wallet.")
+            print("   Please redeem this position manually from the Polymarket portfolio.")
+            return {
+                "success": True,
+                "amount_usdc": estimated_value,
+                "shares_redeemed": 0,
+                "needs_manual_redemption": True,
+                "method": "manual_required_non_signer_owner",
+                "owner": position_owner,
+                "message": (
+                    f"Position is held by {position_owner}, but automatic redemption "
+                    f"can only sign for {config.WALLET_ADDRESS}"
+                ),
+            }
+
+        def _manual_required_for_unknown_negrisk_outcome(estimated_value: float) -> Optional[Dict]:
+            if not negative_risk or outcome_index in (0, 1):
+                return None
+
+            print("⚠️ Neg-risk position is missing outcome_index; refusing to guess YES/NO")
+            print("   Please redeem this position manually from the Polymarket portfolio.")
+            return {
+                "success": True,
+                "amount_usdc": estimated_value,
+                "shares_redeemed": 0,
+                "needs_manual_redemption": True,
+                "method": "manual_required_unknown_negrisk_outcome",
+                "owner": position_owner,
+                "message": "Neg-risk redemption requires outcome_index (0=YES, 1=NO)",
+            }
+
+        # Data-api sets redeemable=True AND curPrice=null for many resolved
+        # short-horizon markets; null parses to current_price=0.0.  Such
+        # positions are WINNERS when current_value > 0.01.  Check the
+        # redeemable+value signal BEFORE the cur_price==0 check so we
+        # don't misclassify them as losers.
+        is_redeemable_winner = redeemable is True and cur_value > 0.01
+
+        if is_redeemable_winner:
+            estimated_value = cur_value if cur_value > 0 else current_shares * 1.0
+            print(f"💰 Winning position (redeemable, value=${cur_value:.4f}): {current_shares:.4f} shares (~${estimated_value:.2f})")
+
+            owner_result = _manual_required_for_non_signer_owner(estimated_value)
+            if owner_result:
+                return owner_result
+            outcome_result = _manual_required_for_unknown_negrisk_outcome(estimated_value)
+            if outcome_result:
+                return outcome_result
+
+            # Try on-chain redemption
+            if condition_id:
+                for attempt in range(max_retries):
+                    try:
+                        result = self._execute_onchain_redemption(
+                            condition_id, token_id, current_shares, negative_risk, outcome_index
+                        )
+                        if result and result.get("success"):
+                            return result
+                        if attempt < max_retries - 1:
+                            print(f"⚠️ Redemption attempt {attempt + 1} failed, retrying in 15s...")
+                            time.sleep(15)  # Longer delay to avoid rate limits
+                    except Exception as e:
+                        print(f"❌ Redemption error (attempt {attempt + 1}): {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(15)  # Longer delay to avoid rate limits
+
+            # If on-chain redemption failed, notify user
+            print(f"   ℹ️ Automatic redemption failed. Please redeem manually.")
+            print(f"   👉 Visit: https://polymarket.com/portfolio")
+
+            return {
+                "success": True,  # Not a failure, just needs manual action
+                "amount_usdc": estimated_value,
+                "shares_redeemed": 0,  # Not actually redeemed yet
+                "needs_manual_redemption": True,
+                "method": "manual_required",
+                "message": f"Please redeem ${estimated_value:.2f} at polymarket.com/portfolio"
+            }
+
+        # If current price is 0.0 and NOT redeemable with value, it's a losing position
         if cur_price == 0:
             return {
                 "success": True,
@@ -2668,17 +3033,26 @@ class PolymarketClient:
                 "method": "losing_position",
                 "message": "Losing position - no redemption value"
             }
-        
+
         # If current price is 1.0, it's a winning position - attempt on-chain redemption
         if cur_price == 1.0 or cur_price >= 0.99:
             estimated_value = current_shares * 1.0
             print(f"💰 Winning position found: {current_shares:.4f} shares (~${estimated_value:.2f})")
+
+            owner_result = _manual_required_for_non_signer_owner(estimated_value)
+            if owner_result:
+                return owner_result
+            outcome_result = _manual_required_for_unknown_negrisk_outcome(estimated_value)
+            if outcome_result:
+                return outcome_result
             
             # Try on-chain redemption
             if condition_id:
                 for attempt in range(max_retries):
                     try:
-                        result = self._execute_onchain_redemption(condition_id, token_id, current_shares, negative_risk)
+                        result = self._execute_onchain_redemption(
+                            condition_id, token_id, current_shares, negative_risk, outcome_index
+                        )
                         if result and result.get("success"):
                             return result
                         if attempt < max_retries - 1:
@@ -2712,30 +3086,55 @@ class PolymarketClient:
         }
     
     def _execute_onchain_redemption(
-        self, 
-        condition_id: str, 
+        self,
+        condition_id: str,
         token_id: str,
         shares: float,
-        negative_risk: bool = False
+        negative_risk: bool = False,
+        outcome_index: int = None,
+        max_resolution_retries: int = 6,
+        resolution_retry_delay: float = 30.0,
     ) -> Optional[Dict]:
         """
         Execute on-chain redemption via the CTF contract or NegRiskAdapter.
-        
-        For standard markets: calls CTF.redeemPositions(collateralToken, parentCollectionId,
-        conditionId, indexSets) trying multiple collateral addresses.
-        
-        For neg-risk markets (e.g. BTC Up/Down): calls NegRiskAdapter.redeemPositions(
-        conditionId, amounts) which has a different signature — the collateral is baked
-        into the adapter contract.
-        
-        After a successful redeem, auto-wraps any USDC.e balance into pUSD
-        so the CLOB trading balance stays usable.
+
+        Polymarket positions on Polygon are collateralised by USDC.e
+        (0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174).  The CTF position
+        ID is derived from keccak256(collateralToken, collectionId), so
+        passing any collateral other than USDC.e computes a *different*
+        position ID and the call silently pays out 0 — it doesn't revert.
+
+        NEG-RISK MARKETS:  Most Polymarket markets (including all 15-min
+        BTC Up/Down) are "negative risk" markets.  These cannot be redeemed
+        by calling CTF.redeemPositions() directly — that will always revert.
+        Instead, they must go through the NegRiskAdapter at
+        0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296, which exposes
+        redeemPositions(bytes32 _conditionId, uint256[] _amounts) where
+        _amounts is [yesAmount, noAmount].
+
+        POLYMARKET RESOLUTION RACE:  The data-api sets redeemable=True and
+        curPrice=1 as soon as the backend knows the outcome, but the
+        on-chain oracle (reportPayouts) lags by seconds-to-minutes.  If we
+        call redeemPositions before the oracle reports, gas estimation
+        reverts with "result for condition not received yet".  The fix is
+        to retry with a delay instead of falling through to wrong
+        collaterals that waste gas for zero payout.
+
+        After a successful redeem, auto-wraps the USDC.e payout into pUSD
+        via the CollateralOnramp so the CLOB trading balance stays usable.
 
         Args:
             condition_id: The condition ID of the resolved market
-            token_id: The token ID (used for logging)
+            token_id: The token ID (used for balance checks)
             shares: Number of shares being redeemed
-            
+            negative_risk: Whether this is a neg-risk market (determines
+                which contract to call — NegRiskAdapter vs CTF)
+            outcome_index: Outcome index from data-api (0=YES, 1=NO).
+                Used to construct the _amounts array for neg-risk redemption.
+            max_resolution_retries: How many times to retry while the
+                on-chain oracle hasn't reported yet
+            resolution_retry_delay: Seconds between resolution retries
+
         Returns:
             Dict with redemption result including tx_hash on success
         """
@@ -2744,30 +3143,40 @@ class PolymarketClient:
             from web3.middleware import ExtraDataToPOAMiddleware
 
             # Contract addresses (Polygon Mainnet)
-            # Per py-clob-client config.py, USDC.e is the actual collateral for
-            # both standard and neg-risk markets on Polygon mainnet (137).
             CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+            NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+            # USDC.e is THE ONLY valid collateral for Polymarket CTF
+            # positions on Polygon mainnet.  Verified on-chain: position
+            # IDs are derived from USDC.e, so any other address yields
+            # a different position ID → payout 0, tokens NOT burned.
             USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            # pUSD is the CLOB-layer trading token, NOT the CTF collateral.
             PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-            CTF_ADAPTER_ADDRESS = "0x7725dc8a1c293e2e9A3C6195ee7e6A3E8eE0926B"
-            LEGACY_NEG_RISK_ADAPTER = "0x49Fbb73e24DC3FC54CD516aB5BBE387c10F53EBA"
 
-            # Collateral candidates the CTF contract may recognise.
-            # ORDER MATTERS: USDC.e is the real backing collateral for Polymarket
-            # positions, so it must come first. Calling redeemPositions with the
-            # wrong collateral does NOT revert — it silently pays out 0 and burns
-            # nothing while returning status 1, so a wrong-collateral tx looks
-            # "successful" unless we verify the actual token burn afterwards.
-            collateral_options = [
+            # NegRiskAdapter ABI (only redeemPositions needed)
+            NR_ADAPTER_ABI = [
+                {
+                    "inputs": [
+                        {"internalType": "bytes32", "name": "_conditionId", "type": "bytes32"},
+                        {"internalType": "uint256[]", "name": "", "type": "uint256[]"},
+                    ],
+                    "name": "redeemPositions",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function",
+                }
+            ]
+
+            # ── Pre-flight: resolve the correct collateral ────────────
+            # Derive the position ID for USDC.e and verify the wallet
+            # actually holds that position.  If not, the token was minted
+            # under a different collateral (unlikely but possible for
+            # very old positions) and we must probe alternatives.
+            COLLATERAL_CANDIDATES = [
                 ("USDC.e", USDCE_ADDRESS),
-                ("pUSD", PUSD_ADDRESS),
-                ("CTF adapter", CTF_ADAPTER_ADDRESS),
-                ("legacy neg-risk adapter", LEGACY_NEG_RISK_ADAPTER),
             ]
 
             # CTF redeemPositions ABI
-            # signature: redeemPositions(address collateralToken, bytes32 parentCollectionId,
-            #                             bytes32 conditionId, uint256[] indexSets)
             CTF_ABI = [
                 {
                     "inputs": [
@@ -2781,6 +3190,31 @@ class PolymarketClient:
                     "stateMutability": "nonpayable",
                     "type": "function"
                 }
+            ]
+
+            # View helpers on the CTF for position-ID derivation
+            CTF_VIEW_ABI = [
+                {
+                    "inputs": [
+                        {"name": "parentCollectionId", "type": "bytes32"},
+                        {"name": "conditionId", "type": "bytes32"},
+                        {"name": "indexSet", "type": "uint256"},
+                    ],
+                    "name": "getCollectionId",
+                    "outputs": [{"name": "", "type": "bytes32"}],
+                    "stateMutability": "pure",
+                    "type": "function",
+                },
+                {
+                    "inputs": [
+                        {"name": "collateralToken", "type": "address"},
+                        {"name": "collectionId", "type": "bytes32"},
+                    ],
+                    "name": "getPositionId",
+                    "outputs": [{"name": "", "type": "bytes32"}],
+                    "stateMutability": "pure",
+                    "type": "function",
+                },
             ]
 
             # Get wallet credentials
@@ -2798,10 +3232,10 @@ class PolymarketClient:
             
             wallet_address = web3.to_checksum_address(wallet_address)
             
-            # Create contract instance for CTF redemption
+            # Create contract instances
             ctf_contract = web3.eth.contract(
                 address=web3.to_checksum_address(CTF_ADDRESS),
-                abi=CTF_ABI
+                abi=CTF_ABI + CTF_VIEW_ABI
             )
             
             # Format condition_id as bytes32
@@ -2813,14 +3247,13 @@ class PolymarketClient:
             # Parent collection ID is null (bytes32 zero) for Polymarket
             parent_collection_id = bytes(32)
             
-            # Index sets: [1, 2] represents YES and NO outcomes
-            # The contract will only pay out for winning outcomes
+            # Index sets: 1 = YES/UP, 2 = NO/DOWN.
+            # We resolve the exact one for the token below. Falling back to
+            # both is valid but costs more gas and can exceed conservative caps.
             index_sets = [1, 2]
+            redeem_index_sets = None
 
             # ── Pre-flight: check CTF token balance ───────────────────
-            # CTF is an ERC1155 contract, so balanceOf takes (address, uint256 tokenId).
-            # Using the ERC20 signature balanceOf(address) reverts on-chain, which
-            # would silently abort the whole redemption before it even starts.
             erc1155_balance_abi = [
                 {
                     "inputs": [
@@ -2844,27 +3277,120 @@ class PolymarketClient:
                 return {"success": True, "amount_usdc": 0, "shares_redeemed": 0, "method": "already_redeemed"}
 
             # Snapshot balance before redeem to verify burn.
-            # `held` is the exact on-chain raw balance (6-dec USDC units for
-            # Polymarket), so use it directly rather than the float `shares`
-            # which loses precision (e.g. 259.4978 -> 259497799 vs real 259497875).
             balance_before = held
 
             print(f"   🔗 Executing on-chain redemption...")
             print(f"      Condition ID: {condition_id[:16]}...")
             print(f"      Shares: {shares:.4f} (on-chain raw: {held})")
             print(f"      CTF tokens held: {balance_before}")
+            print(f"      Neg-risk: {negative_risk}")
 
-            # ── Redeem via standard CTF.redeemPositions ────────────────
-            # USDC.e is the backing collateral for Polymarket positions (per
-            # py-clob-client config). We try each collateral candidate; the
-            # CTF silently pays out 0 for a wrong collateral (no revert), so
-            # we verify the actual token burn before declaring success.
+            # ═══════════════════════════════════════════════════════════════
+            # NEG-RISK PATH:  Redeem via NegRiskAdapter
+            # ═══════════════════════════════════════════════════════════════
+            # Neg-risk markets (all BTC 15m Up/Down, most Polymarket markets)
+            # CANNOT be redeemed by calling CTF.redeemPositions() directly.
+            # That call always reverts because the actual positions are held
+            # by the NegRiskAdapter vault.  Instead, we call
+            #   NegRiskAdapter.redeemPositions(conditionId, [yesAmt, noAmt])
+            # where [yesAmt, noAmt] encodes how many of each outcome to
+            # redeem.  For a winning YES position: [held, 0].  For a
+            # winning NO position: [0, held].
+            if negative_risk:
+                return self._execute_negrisk_redemption(
+                    web3, wallet_address, private_key,
+                    NEG_RISK_ADAPTER_ADDRESS, NR_ADAPTER_ABI,
+                    CTF_ADDRESS, condition_id_bytes, token_id_int,
+                    balance_before, held, shares, outcome_index,
+                    max_resolution_retries, resolution_retry_delay,
+                )
+
+            # ═══════════════════════════════════════════════════════════════
+            # STANDARD PATH:  Redeem via CTF contract directly
+            # ═══════════════════════════════════════════════════════════════
+
+            # ── Resolve the correct collateral via position-ID ────────
+            # Compute which collateral the CTF position was minted with.
+            # The position ID is keccak256(collateralToken, collectionId)
+            # where collectionId = hash(parent, condId, indexSet).
+            # If USDC.e doesn't match, fall back to a broader probe.
+            resolved_collateral = None
+            for coll_name, coll_addr in COLLATERAL_CANDIDATES:
+                for idx in index_sets:
+                    try:
+                        coll_id = ctf_contract.functions.getCollectionId(
+                            parent_collection_id, condition_id_bytes, idx
+                        ).call()
+                        pos_id_bytes = ctf_contract.functions.getPositionId(
+                            web3.to_checksum_address(coll_addr), coll_id
+                        ).call()
+                        pos_id_int = int.from_bytes(pos_id_bytes, "big")
+                        if pos_id_int == token_id_int:
+                            resolved_collateral = (coll_name, coll_addr)
+                            redeem_index_sets = [idx]
+                            break
+                    except Exception:
+                        pass
+                if resolved_collateral:
+                    break
+
+            if resolved_collateral:
+                # Verified: the token was minted under this collateral.
+                collateral_name, collateral_address = resolved_collateral
+                print(f"      Collateral: {collateral_name} (verified via position ID)")
+            else:
+                # Fallback: the position ID didn't match USDC.e.
+                # This can happen for very old or exotic markets.  Fall
+                # back to probing pUSD and the CTF adapter.  These
+                # alternate collaterals should be rare, so we probe only
+                # when the primary fails.
+                print(f"      ⚠️ Position ID doesn't match USDC.e — probing alternatives...")
+                ALTERNATE_COLLATERALS = [
+                    ("pUSD", PUSD_ADDRESS),
+                    ("CTF adapter", "0x7725dc8a1c293e2e9A3C6195ee7e6A3E8eE0926B"),
+                ]
+                for alt_name, alt_addr in ALTERNATE_COLLATERALS:
+                    for idx in index_sets:
+                        try:
+                            coll_id = ctf_contract.functions.getCollectionId(
+                                parent_collection_id, condition_id_bytes, idx
+                            ).call()
+                            pos_id_bytes = ctf_contract.functions.getPositionId(
+                                web3.to_checksum_address(alt_addr), coll_id
+                            ).call()
+                            pos_id_int = int.from_bytes(pos_id_bytes, "big")
+                            if pos_id_int == token_id_int:
+                                resolved_collateral = (alt_name, alt_addr)
+                                redeem_index_sets = [idx]
+                                break
+                        except Exception:
+                            pass
+                    if resolved_collateral:
+                        break
+
+                if resolved_collateral:
+                    collateral_name, collateral_address = resolved_collateral
+                    print(f"      Collateral: {collateral_name} (verified via position ID)")
+                else:
+                    # Last resort: try USDC.e anyway (most common case).
+                    collateral_name, collateral_address = ("USDC.e", USDCE_ADDRESS)
+                    print(f"      Collateral: USDC.e (unverified — position ID probe failed)")
+
+            if redeem_index_sets:
+                index_sets = redeem_index_sets
+                print(f"      Redeeming index set: {index_sets}")
+
+            # ── Call CTF.redeemPositions with the correct collateral ──
+            # Retry loop handles the race between the data-api's
+            # "redeemable" flag and the on-chain oracle report.  When the
+            # oracle hasn't reported yet, gas estimation reverts with
+            # "result for condition not received yet".  Waiting and
+            # retrying is the only correct response — falling through to
+            # other collaterals wastes gas (payout=0, tokens not burned).
             last_error = None
 
-            for collateral_name, collateral_address in collateral_options:
+            for attempt in range(max_resolution_retries):
                 try:
-                    print(f"   🔄 Trying CTF with collateral: {collateral_name} ...")
-
                     tx = ctf_contract.functions.redeemPositions(
                         web3.to_checksum_address(collateral_address),
                         parent_collection_id,
@@ -2873,20 +3399,55 @@ class PolymarketClient:
                     ).build_transaction({
                         'from': wallet_address,
                         'nonce': web3.eth.get_transaction_count(wallet_address),
-                        'gas': 200000,
+                        # Give estimate_gas enough headroom. A valid redemption
+                        # with both outcome index sets can exceed 200k and some
+                        # RPCs report that as a generic execution revert.
+                        'gas': 1_000_000,
                         'gasPrice': web3.eth.gas_price,
                         'chainId': 137
                     })
                     
-                    # Estimate gas
+                    # Estimate gas — three possible outcomes:
+                    #  1. Success → proceed to sign & send
+                    #  2. "result for condition not received yet" → oracle hasn't
+                    #     reported, retry after delay
+                    #  3. Generic revert / RPC error → could be transient, retry
+                    #     with a shorter delay.  If the condition is genuinely
+                    #     unresolvable, we'll exhaust retries and report the error.
                     try:
                         gas_estimate = web3.eth.estimate_gas(tx)
                         tx['gas'] = int(gas_estimate * 1.2)
                     except Exception as e:
-                        if config.VERBOSE_LOGGING:
-                            print(f"      ⚠️ Gas estimation failed ({collateral_name}): {e}")
-                        last_error = e
-                        continue
+                        err_text = str(e).lower()
+                        is_oracle_race = ("result" in err_text and "not received" in err_text)
+                        is_generic_revert = ("execution reverted" in err_text and not is_oracle_race)
+
+                        if is_oracle_race:
+                            # On-chain oracle hasn't reported yet.
+                            if attempt < max_resolution_retries - 1:
+                                print(f"      ⏳ On-chain oracle hasn't reported yet (attempt {attempt + 1}/{max_resolution_retries}), "
+                                      f"retrying in {resolution_retry_delay:.0f}s...")
+                                time.sleep(resolution_retry_delay)
+                                continue
+                            else:
+                                print(f"      ❌ Condition still unresolved after {max_resolution_retries} retries")
+                                last_error = "condition not resolved on-chain"
+                                break
+                        elif is_generic_revert:
+                            # Could be a transient RPC error or a genuine issue.
+                            # Retry with a short delay; if it persists, it's real.
+                            if attempt < max_resolution_retries - 1:
+                                print(f"      ⚠️ Gas estimation reverted (attempt {attempt + 1}/{max_resolution_retries}): {e}")
+                                print(f"         Retrying in 10s (may be transient RPC issue)...")
+                                time.sleep(10)
+                                continue
+                            else:
+                                print(f"      ❌ Gas estimation keeps reverting after {max_resolution_retries} retries: {e}")
+                                last_error = f"gas estimation reverted: {e}"
+                                break
+                        else:
+                            # Unexpected error — don't retry, bail out.
+                            raise
                     
                     # Sign and send transaction
                     signed_tx = web3.eth.account.sign_transaction(tx, private_key)
@@ -2904,12 +3465,12 @@ class PolymarketClient:
                         # CRITICAL: verify the position was actually burned.
                         # redeemPositions with the WRONG collateral does NOT
                         # revert — it returns status 1 but pays out 0 and burns
-                        # nothing. Only treat it as success if tokens were burned.
+                        # nothing.  This shouldn't happen now that we resolve
+                        # the collateral via position ID, but we check anyway.
                         if balance_after >= balance_before:
-                            if config.VERBOSE_LOGGING:
-                                print(f"      ⚠️ {collateral_name}: tx succeeded but 0 tokens burned (wrong collateral) — trying next")
-                            last_error = f"{collateral_name}: no tokens burned (wrong collateral)"
-                            continue
+                            last_error = f"{collateral_name}: no tokens burned (wrong collateral?)"
+                            print(f"      ⚠️ {last_error}")
+                            break
 
                         shares_burned = (balance_before - balance_after) / 1e6
 
@@ -2935,12 +3496,14 @@ class PolymarketClient:
 
                     print(f"   ❌ Transaction failed (reverted) with {collateral_name}")
                     last_error = "transaction reverted"
+                    break
                 except Exception as e:
                     last_error = e
                     print(f"      ⚠️ {collateral_name} redemption failed: {e}")
+                    break
 
             if last_error:
-                print(f"   ❌ Redemption failed for all methods: {last_error}")
+                print(f"   ❌ Redemption failed: {last_error}")
             return None
                 
         except ImportError:
@@ -2949,6 +3512,184 @@ class PolymarketClient:
         except Exception as e:
             print(f"❌ On-chain redemption error: {e}")
             return None
+
+    def _execute_negrisk_redemption(
+        self,
+        web3,
+        wallet_address: str,
+        private_key: str,
+        nr_adapter_address: str,
+        nr_adapter_abi: list,
+        ctf_address: str,
+        condition_id_bytes: bytes,
+        token_id_int: int,
+        balance_before: int,
+        held: int,
+        shares: float,
+        outcome_index,
+        max_resolution_retries: int = 6,
+        resolution_retry_delay: float = 30.0,
+    ) -> Optional[Dict]:
+        """
+        Redeem a neg-risk position via the NegRiskAdapter contract.
+
+        Neg-risk markets (including all BTC 15-min Up/Down) hold their
+        conditional tokens in the NegRiskAdapter vault.  Calling
+        CTF.redeemPositions() directly will always revert for these tokens.
+        Instead, we call:
+
+            NegRiskAdapter.redeemPositions(conditionId, [yesAmount, noAmount])
+
+        The amounts array has two entries:
+          - amounts[0] = YES tokens to redeem
+          - amounts[1] = NO  tokens to redeem
+
+        For a winning YES position (outcome_index=0): [held, 0]
+        For a winning NO  position (outcome_index=1): [0, held]
+
+        The amounts are in raw on-chain units (6 decimals for USDC.e).
+        """
+        # Build the amounts array based on the outcome we hold.
+        # outcome_index: 0 = YES, 1 = NO (per Polymarket data-api). Guessing is
+        # unsafe here because it can submit a real transaction for the wrong
+        # side; callers should route missing outcome_index to manual redemption.
+        if outcome_index not in (0, 1):
+            print("      ❌ outcome_index missing for neg-risk redemption; refusing to guess")
+            return None
+
+        amounts = [0, 0]
+        amounts[outcome_index] = held
+
+        print(f"      Method: NegRiskAdapter.redeemPositions")
+        print(f"      Amounts: [{amounts[0]}, {amounts[1]}] (YES={amounts[0]}, NO={amounts[1]})")
+
+        # Create the NegRiskAdapter contract instance
+        nr_adapter = web3.eth.contract(
+            address=web3.to_checksum_address(nr_adapter_address),
+            abi=nr_adapter_abi,
+        )
+
+        # ERC-1155 balanceOf for post-redeem verification
+        erc1155_balance_abi = [
+            {
+                "inputs": [
+                    {"name": "account", "type": "address"},
+                    {"name": "id", "type": "uint256"},
+                ],
+                "name": "balanceOf",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function",
+            }
+        ]
+        ctf_token = web3.eth.contract(
+            address=web3.to_checksum_address(ctf_address),
+            abi=erc1155_balance_abi,
+        )
+
+        # Retry loop: handles the resolution race (oracle hasn't reported yet)
+        last_error = None
+        for attempt in range(max_resolution_retries):
+            try:
+                tx = nr_adapter.functions.redeemPositions(
+                    condition_id_bytes,
+                    amounts,
+                ).build_transaction({
+                    'from': wallet_address,
+                    'nonce': web3.eth.get_transaction_count(wallet_address),
+                    # Give estimate_gas enough headroom before replacing it
+                    # with the measured value below.
+                    'gas': 1_000_000,
+                    'gasPrice': web3.eth.gas_price,
+                    'chainId': 137,
+                })
+
+                # Gas estimation with the same retry logic as CTF redemption
+                try:
+                    gas_estimate = web3.eth.estimate_gas(tx)
+                    tx['gas'] = int(gas_estimate * 1.2)
+                except Exception as e:
+                    err_text = str(e).lower()
+                    is_oracle_race = ("result" in err_text and "not received" in err_text)
+                    is_generic_revert = ("execution reverted" in err_text and not is_oracle_race)
+
+                    if is_oracle_race:
+                        if attempt < max_resolution_retries - 1:
+                            print(f"      ⏳ On-chain oracle hasn't reported yet (attempt {attempt + 1}/{max_resolution_retries}), "
+                                  f"retrying in {resolution_retry_delay:.0f}s...")
+                            time.sleep(resolution_retry_delay)
+                            continue
+                        else:
+                            print(f"      ❌ Condition still unresolved after {max_resolution_retries} retries")
+                            last_error = "condition not resolved on-chain"
+                            break
+                    elif is_generic_revert:
+                        if attempt < max_resolution_retries - 1:
+                            print(f"      ⚠️ Gas estimation reverted (attempt {attempt + 1}/{max_resolution_retries}): {e}")
+                            print(f"         Retrying in 10s (may be transient RPC issue)...")
+                            time.sleep(10)
+                            continue
+                        else:
+                            print(f"      ❌ Gas estimation keeps reverting after {max_resolution_retries} retries: {e}")
+                            last_error = f"gas estimation reverted: {e}"
+                            break
+                    else:
+                        raise
+
+                # Sign and send transaction
+                signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_hash_hex = tx_hash.hex()
+
+                print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
+
+                # Wait for transaction receipt
+                receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if receipt['status'] == 1:
+                    balance_after = ctf_token.functions.balanceOf(wallet_address, token_id_int).call()
+
+                    if balance_after >= balance_before:
+                        last_error = "NegRiskAdapter: no tokens burned (unexpected)"
+                        print(f"      ⚠️ {last_error}")
+                        break
+
+                    shares_burned = (balance_before - balance_after) / 1e6
+
+                    print(f"   ✅ Redemption successful via NegRiskAdapter!")
+                    print(f"      TX: https://polygonscan.com/tx/{tx_hash_hex}")
+
+                    result = {
+                        "success": True,
+                        "amount_usdc": shares_burned,
+                        "shares_redeemed": shares_burned,
+                        "method": "onchain_redemption_negrisk",
+                        "index_set": amounts,
+                        "tx_hash": tx_hash_hex,
+                        "gas_used": receipt['gasUsed'],
+                    }
+                    # After a neg-risk redemption theAdapter unwraps USDC.e
+                    # from its vault and sends it to the caller.  Try to wrap
+                    # any loose USDC.e into pUSD so the CLOB balance is usable.
+                    USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+                    wrap_result = self._wrap_legacy_usdce_to_pusd(
+                        web3, wallet_address, private_key, USDCE_ADDRESS,
+                    )
+                    if wrap_result:
+                        result.update(wrap_result)
+                    return result
+
+                print(f"   ❌ Transaction failed (reverted) via NegRiskAdapter")
+                last_error = "transaction reverted"
+                break
+            except Exception as e:
+                last_error = e
+                print(f"      ⚠️ NegRiskAdapter redemption failed: {e}")
+                break
+
+        if last_error:
+            print(f"   ❌ Neg-risk redemption failed: {last_error}")
+        return None
 
     def _wrap_legacy_usdce_to_pusd(
         self,
@@ -3195,9 +3936,28 @@ class PolymarketClient:
             }
         
         print("🔍 Checking positions for redemption...")
-        
-        positions = self.get_open_positions()
-        
+
+        # for_redemption=True: if the data-api is transiently unavailable, return
+        # None rather than falling back to the trade-history reconstruction
+        # (which lacks current_price/redeemable and would make every real
+        # winner look like a loss). We skip the cycle instead of blind-sweeping.
+        positions = self.get_open_positions(for_redemption=True)
+
+        if positions is None:
+            print("⚠️ Could not fetch positions with redemption metadata; skipping this cycle")
+            return {
+                "total_redeemed": 0,
+                "positions_processed": 0,
+                "winning_positions": 0,
+                "losing_positions": 0,
+                "unresolved_positions": 0,
+                "onchain_redeemed": 0,
+                "already_redeemed": 0,
+                "needs_manual_redemption": 0,
+                "failed": [],
+                "positions_unavailable": True,
+            }
+
         if not positions:
             print("ℹ️ No open positions found")
             return {
@@ -3205,6 +3965,7 @@ class PolymarketClient:
                 "positions_processed": 0,
                 "winning_positions": 0,
                 "losing_positions": 0,
+                "unresolved_positions": 0,
                 "onchain_redeemed": 0,
                 "already_redeemed": 0,
                 "needs_manual_redemption": 0,
@@ -3234,41 +3995,51 @@ class PolymarketClient:
                 continue
             
             # ════════════════════════════════════════════════════════════════
-            # CRITICAL: Only redeem WINNING positions (price >= 0.90)
-            # Losing positions have price ~= 0.0 and should be SKIPPED
+            # CRITICAL: Only redeem WINNING positions.
+            #
+            # The data-api returns curPrice=null for many resolved markets
+            # (e.g. the 15-minute Bitcoin Up/Down markets), so current_price
+            # parses to 0.0 and the legacy cur_price >= 0.90 test matches
+            # nothing — including real winners. We need BOTH of these signals:
+            #   - redeemable is True : the market has resolved (NOT just live).
+            #     redeemable=False means unresolved — redeeming it reverts on-chain.
+            #   - current_value > 0.01: the position resolved IN OUR FAVOR.
+            #     Losers are also marked redeemable=True but have value 0.
+            # Validated against live data: this identifies exactly the real
+            # winners with zero false positives.
             # ════════════════════════════════════════════════════════════════
-            
-            if cur_price < 0.10:
+
+            cur_value = pos.get("current_value", 0)
+            is_winner = (redeemable is True and cur_value > 0.01) or cur_price >= 0.90
+
+            if not is_winner:
+                if cur_price > 0.10:
+                    # Market not yet resolved or mid-priced - skip for now
+                    unresolved_positions += 1
+                    if config.VERBOSE_LOGGING:
+                        print(f"   ⏳ PENDING: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - not resolved")
+                    continue
                 # This is a LOSING position (resolved to ~0) - no value to redeem
                 losing_positions += 1
                 if config.VERBOSE_LOGGING and getattr(config, "REDEMPTION_VERBOSE_LOSSES", False):
                     print(f"   ❌ LOSS: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - skipping")
                 continue
-            elif cur_price < 0.90:
-                # Market not yet resolved or mid-priced - skip for now
-                unresolved_positions += 1
-                if config.VERBOSE_LOGGING:
-                    print(f"   ⏳ PENDING: {title}... ({shares:.2f} shares @ ${cur_price:.2f}) - not resolved")
-                continue
-            elif redeemable is False:
-                unresolved_positions += 1
-                if config.VERBOSE_LOGGING:
-                    print(f"   ⏳ NOT REDEEMABLE: {title}... ({shares:.2f} shares @ ${cur_price:.2f})")
-                continue
             
             # ════════════════════════════════════════════════════════════════
-            # This is a WINNING position (price >= 0.90) - attempt redemption
+            # This is a WINNING position - attempt redemption
             # ════════════════════════════════════════════════════════════════
             winning_positions += 1
-            estimated_value = shares * cur_price
+            # Use the API's current_value when price is unavailable (null for
+            # resolved markets); fall back to shares*price otherwise.
+            estimated_value = cur_value if cur_value > 0 else shares * cur_price
             print(f"\n   💰 WIN: {title}...")
-            print(f"      {shares:.4f} shares @ ${cur_price:.2f} (~${estimated_value:.2f})")
+            print(f"      {shares:.4f} shares (~${estimated_value:.2f})")
             
             # Attempt redemption
-            result = self.redeem_winning_shares(token_id, shares)
+            result = self.redeem_winning_shares(token_id, shares, known_position=pos)
             
             if result:
-                if result.get("method") == "onchain_redemption":
+                if result.get("method") in ("onchain_redemption", "onchain_redemption_negrisk"):
                     # Successfully redeemed on-chain
                     onchain_redeemed += 1
                     amount = result.get("amount_usdc", 0)
@@ -3288,10 +4059,15 @@ class PolymarketClient:
                     positions_needing_redemption.append({
                         "token_id": token_id[:16] + "...",
                         "shares": shares,
-                        "value": value
+                        "value": value,
+                        "owner": result.get("owner"),
+                        "method": result.get("method"),
                     })
                     failed.append(token_id)
                     print(f"      ⚠️ Needs manual redemption")
+            else:
+                failed.append(token_id)
+                print(f"      ⚠️ Automatic redemption failed")
         
         summary = {
             "total_redeemed": total_redeemed,
@@ -3319,6 +4095,8 @@ class PolymarketClient:
             print(f"   👉 Visit https://polymarket.com/portfolio to redeem:")
             for pos in positions_needing_redemption:
                 print(f"      • {pos['shares']:.4f} shares (~${pos['value']:.2f})")
+                if pos.get("owner"):
+                    print(f"        Owner: {pos['owner']}")
         
         return summary
 

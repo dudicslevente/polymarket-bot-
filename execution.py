@@ -17,7 +17,7 @@ import random
 import time
 import json
 import os
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -26,8 +26,9 @@ import config
 from market import Market, PolymarketClient
 from strategy import TradeSignal
 
-# File to persist active trades (survives bot restarts)
+# File to persist live execution state (survives bot restarts)
 ACTIVE_TRADES_FILE = "active_trades.json"
+ACTIVE_TRADES_SCHEMA_VERSION = 2
 
 
 class TradeStatus(Enum):
@@ -71,6 +72,18 @@ class Trade:
     condition_id: Optional[str] = None  # Market condition ID for resolution
     redemption_status: Optional[str] = None  # "PENDING", "REDEEMED", "FAILED"
     redemption_amount: Optional[float] = None  # Amount redeemed in pUSD
+    redemption_tx_hash: Optional[str] = None  # On-chain redemption transaction hash
+    redemption_method: Optional[str] = None  # onchain_redemption, manual_required, etc.
+
+
+def _datetime_to_iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _datetime_from_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
 
 
 @dataclass
@@ -146,88 +159,202 @@ class ExecutionEngine:
     
     def _load_active_trades(self):
         """
-        Load active trades from disk on startup.
+        Load active trades and live accounting state from disk on startup.
         
         This ensures trades aren't lost if the bot restarts before resolution.
+        Newer files include accounting/cooldown state as well as active trades;
+        old list-only files are still accepted.
         """
         if not os.path.exists(ACTIVE_TRADES_FILE):
             return
         
         try:
             with open(ACTIVE_TRADES_FILE, 'r') as f:
-                trades_data = json.load(f)
+                persisted = json.load(f)
             
-            if not trades_data:
+            if not persisted:
                 return
+
+            if isinstance(persisted, list):
+                # Backwards compatibility with the original active-trades-only
+                # file format.
+                state_data = {}
+                trades_data = persisted
+                traded_markets = []
+            else:
+                state_data = persisted.get("state", {})
+                trades_data = persisted.get("active_trades", [])
+                traded_markets = persisted.get("traded_markets", [])
+
+            self._restore_persisted_state(state_data)
             
             loaded_count = 0
             for trade_dict in trades_data:
                 try:
                     # Reconstruct Trade object from dict
-                    trade = Trade(
-                        trade_id=trade_dict["trade_id"],
-                        market_id=trade_dict["market_id"],
-                        market_question=trade_dict["market_question"],
-                        side=trade_dict["side"],
-                        entry_odds=trade_dict["entry_odds"],
-                        fair_probability=trade_dict["fair_probability"],
-                        edge=trade_dict["edge"],
-                        btc_price_at_entry=trade_dict["btc_price_at_entry"],
-                        bet_size=trade_dict["bet_size"],
-                        balance_before=trade_dict["balance_before"],
-                        balance_after=trade_dict["balance_after"],
-                        status=TradeStatus(trade_dict["status"]),
-                        entry_time=datetime.fromisoformat(trade_dict["entry_time"]),
-                        mode=trade_dict.get("mode", "LIVE"),
-                        token_id=trade_dict.get("token_id"),
-                        condition_id=trade_dict.get("condition_id"),
-                        order_id=trade_dict.get("order_id"),
-                        filled_price=trade_dict.get("filled_price"),
-                        filled_shares=trade_dict.get("filled_shares"),
-                    )
+                    trade = self._trade_from_dict(trade_dict)
                     self.state.active_trades[trade.trade_id] = trade
+                    self.polymarket.traded_markets.add(trade.market_id)
                     loaded_count += 1
                 except Exception as e:
                     print(f"⚠️ Could not load trade {trade_dict.get('trade_id', '?')}: {e}")
-            
+
+            for market_id in traded_markets:
+                if market_id:
+                    self.polymarket.traded_markets.add(market_id)
+
             if loaded_count > 0:
                 print(f"📂 Loaded {loaded_count} pending trade(s) from previous session")
                 
         except Exception as e:
             print(f"⚠️ Could not load active trades file: {e}")
+
+    def _restore_persisted_state(self, state_data: Dict[str, Any]):
+        """Restore live counters that cannot be reconstructed from wallet balance."""
+        if not state_data:
+            return
+
+        live_balance = self.state.balance
+
+        self.state.resolved_balance = float(
+            state_data.get("resolved_balance", self.state.resolved_balance)
+        )
+        self.state.session_starting_balance = float(
+            state_data.get("session_starting_balance", self.state.session_starting_balance)
+        )
+        self.state.daily_starting_balance = float(
+            state_data.get("daily_starting_balance", self.state.daily_starting_balance)
+        )
+        self.state.total_trades = int(state_data.get("total_trades", self.state.total_trades))
+        self.state.wins = int(state_data.get("wins", self.state.wins))
+        self.state.losses = int(state_data.get("losses", self.state.losses))
+        self.state.daily_trades = int(state_data.get("daily_trades", self.state.daily_trades))
+        self.state.daily_wins = int(state_data.get("daily_wins", self.state.daily_wins))
+        self.state.daily_losses = int(state_data.get("daily_losses", self.state.daily_losses))
+        self.state.daily_pnl = float(state_data.get("daily_pnl", self.state.daily_pnl))
+        self.state.consecutive_losses = int(
+            state_data.get("consecutive_losses", self.state.consecutive_losses)
+        )
+        self.state.consecutive_wins = int(
+            state_data.get("consecutive_wins", self.state.consecutive_wins)
+        )
+        self.state.trading_paused = bool(
+            state_data.get("trading_paused", self.state.trading_paused)
+        )
+        self.state.pause_reason = state_data.get("pause_reason", self.state.pause_reason)
+        self.state.last_trade_time = _datetime_from_iso(
+            state_data.get("last_trade_time")
+        ) or self.state.last_trade_time
+        self.state.daily_reset_date = _datetime_from_iso(
+            state_data.get("daily_reset_date")
+        ) or self.state.daily_reset_date
+        self.state.pause_until = _datetime_from_iso(state_data.get("pause_until"))
+
+        # Wallet balance is the live source of truth; persisted balance is kept
+        # only for older files or diagnostics.
+        self.state.balance = live_balance
+
+    def _trade_from_dict(self, trade_dict: Dict[str, Any]) -> Trade:
+        """Reconstruct a Trade object from persisted JSON."""
+        return Trade(
+            trade_id=trade_dict["trade_id"],
+            market_id=trade_dict["market_id"],
+            market_question=trade_dict["market_question"],
+            side=trade_dict["side"],
+            entry_odds=float(trade_dict["entry_odds"]),
+            fair_probability=float(trade_dict["fair_probability"]),
+            edge=float(trade_dict["edge"]),
+            btc_price_at_entry=float(trade_dict["btc_price_at_entry"]),
+            bet_size=float(trade_dict["bet_size"]),
+            balance_before=float(trade_dict.get("balance_before", 0.0)),
+            balance_after=float(trade_dict.get("balance_after", 0.0)),
+            status=TradeStatus(trade_dict["status"]),
+            entry_time=_datetime_from_iso(trade_dict["entry_time"]),
+            resolution_time=_datetime_from_iso(trade_dict.get("resolution_time")),
+            outcome=trade_dict.get("outcome"),
+            payout=float(trade_dict.get("payout", 0.0)),
+            mode=trade_dict.get("mode", "LIVE"),
+            order_id=trade_dict.get("order_id"),
+            order_status=trade_dict.get("order_status"),
+            filled_price=trade_dict.get("filled_price"),
+            filled_shares=trade_dict.get("filled_shares"),
+            token_id=trade_dict.get("token_id"),
+            condition_id=trade_dict.get("condition_id"),
+            redemption_status=trade_dict.get("redemption_status"),
+            redemption_amount=trade_dict.get("redemption_amount"),
+            redemption_tx_hash=trade_dict.get("redemption_tx_hash"),
+            redemption_method=trade_dict.get("redemption_method"),
+        )
+
+    def _trade_to_dict(self, trade: Trade) -> Dict[str, Any]:
+        """Serialize a Trade object to JSON-friendly primitives."""
+        return {
+            "trade_id": trade.trade_id,
+            "market_id": trade.market_id,
+            "market_question": trade.market_question,
+            "side": trade.side,
+            "entry_odds": trade.entry_odds,
+            "fair_probability": trade.fair_probability,
+            "edge": trade.edge,
+            "btc_price_at_entry": trade.btc_price_at_entry,
+            "bet_size": trade.bet_size,
+            "balance_before": trade.balance_before,
+            "balance_after": trade.balance_after,
+            "status": trade.status.value,
+            "entry_time": trade.entry_time.isoformat(),
+            "resolution_time": _datetime_to_iso(trade.resolution_time),
+            "outcome": trade.outcome,
+            "payout": trade.payout,
+            "mode": trade.mode,
+            "token_id": trade.token_id,
+            "condition_id": trade.condition_id,
+            "order_id": trade.order_id,
+            "order_status": trade.order_status,
+            "filled_price": trade.filled_price,
+            "filled_shares": trade.filled_shares,
+            "redemption_status": trade.redemption_status,
+            "redemption_amount": trade.redemption_amount,
+            "redemption_tx_hash": trade.redemption_tx_hash,
+            "redemption_method": trade.redemption_method,
+        }
     
     def _save_active_trades(self):
         """
-        Save active trades to disk for persistence across restarts.
+        Save active trades and live accounting state across restarts.
         """
         try:
-            trades_data = []
-            for trade in self.state.active_trades.values():
-                trade_dict = {
-                    "trade_id": trade.trade_id,
-                    "market_id": trade.market_id,
-                    "market_question": trade.market_question,
-                    "side": trade.side,
-                    "entry_odds": trade.entry_odds,
-                    "fair_probability": trade.fair_probability,
-                    "edge": trade.edge,
-                    "btc_price_at_entry": trade.btc_price_at_entry,
-                    "bet_size": trade.bet_size,
-                    "balance_before": trade.balance_before,
-                    "balance_after": trade.balance_after,
-                    "status": trade.status.value,
-                    "entry_time": trade.entry_time.isoformat(),
-                    "mode": trade.mode,
-                    "token_id": trade.token_id,
-                    "condition_id": trade.condition_id,
-                    "order_id": trade.order_id,
-                    "filled_price": trade.filled_price,
-                    "filled_shares": trade.filled_shares,
-                }
-                trades_data.append(trade_dict)
+            payload = {
+                "version": ACTIVE_TRADES_SCHEMA_VERSION,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "state": {
+                    "balance": self.state.balance,
+                    "resolved_balance": self.state.resolved_balance,
+                    "session_starting_balance": self.state.session_starting_balance,
+                    "last_trade_time": _datetime_to_iso(self.state.last_trade_time),
+                    "total_trades": self.state.total_trades,
+                    "wins": self.state.wins,
+                    "losses": self.state.losses,
+                    "daily_starting_balance": self.state.daily_starting_balance,
+                    "daily_trades": self.state.daily_trades,
+                    "daily_wins": self.state.daily_wins,
+                    "daily_losses": self.state.daily_losses,
+                    "daily_pnl": self.state.daily_pnl,
+                    "daily_reset_date": _datetime_to_iso(self.state.daily_reset_date),
+                    "consecutive_losses": self.state.consecutive_losses,
+                    "consecutive_wins": self.state.consecutive_wins,
+                    "trading_paused": self.state.trading_paused,
+                    "pause_reason": self.state.pause_reason,
+                    "pause_until": _datetime_to_iso(self.state.pause_until),
+                },
+                "active_trades": [
+                    self._trade_to_dict(trade)
+                    for trade in self.state.active_trades.values()
+                ],
+                "traded_markets": sorted(self.polymarket.traded_markets),
+            }
             
             with open(ACTIVE_TRADES_FILE, 'w') as f:
-                json.dump(trades_data, f, indent=2)
+                json.dump(payload, f, indent=2)
                 
         except Exception as e:
             print(f"❌ Failed to save active trades: {e}")
@@ -405,6 +532,9 @@ class ExecutionEngine:
             # Resume trading if paused for daily limit
             if self.state.trading_paused and "daily" in (self.state.pause_reason or "").lower():
                 self._resume_trading()
+
+            if not config.TEST_MODE:
+                self._save_active_trades()
     
     def _check_daily_loss_limit(self) -> bool:
         """
@@ -493,6 +623,9 @@ class ExecutionEngine:
             self.state.pause_until = None
             print(f"⛔ TRADING PAUSED: {reason}")
             print(f"   Will resume at next daily reset (midnight UTC)")
+
+        if not config.TEST_MODE:
+            self._save_active_trades()
     
     def _resume_trading(self):
         """
@@ -504,6 +637,9 @@ class ExecutionEngine:
         self.state.trading_paused = False
         self.state.pause_reason = None
         self.state.pause_until = None
+
+        if not config.TEST_MODE:
+            self._save_active_trades()
     
     def get_daily_stats(self) -> Dict:
         """
@@ -776,25 +912,29 @@ class ExecutionEngine:
                 # Try to cancel the unfilled order
                 print(f"⚠️ Order fill timeout, attempting to cancel...")
                 cancelled = self.polymarket.cancel_order(order_id)
-                if cancelled:
+                reconcile = self._reconcile_live_order_for_trade(trade)
+                if reconcile["success"] and reconcile.get("filled_shares", 0) > 0:
+                    return self._apply_fill_result_to_trade(trade, reconcile)
+                if reconcile["status"] in ["CANCELLED", "CANCELED", "EXPIRED", "REJECTED"]:
+                    print(f"✅ Unfilled order is {reconcile['status'].lower()}")
+                    return False
+                if cancelled and reconcile["status"] == "UNCONFIRMED_NO_FILL":
                     print("✅ Unfilled order cancelled")
-                else:
-                    print("⚠️ Could not cancel order - may have filled")
-                    # Re-check status
-                    final_check = self.polymarket.get_order_status(order_id)
-                    if final_check and not final_check.get("_error"):
-                        status = self.polymarket._parse_order_status(final_check)
-                        if status in ["FILLED", "MATCHED"]:
-                            # Actually it filled!
-                            fill_info = self.polymarket._extract_fill_info(final_check)
-                            trade.order_status = status
-                            trade.filled_price = fill_info["filled_price"]
-                            trade.filled_shares = fill_info["filled_shares"]
-                            trade.entry_odds = trade.filled_price or trade.entry_odds
-                            print(f"✅ Order actually filled: {trade.filled_shares:.2f} shares @ ${trade.filled_price:.4f}")
-                            # Sync balance after successful trade
-                            self._sync_balance_after_trade()
-                            return True
+                    return False
+                if reconcile["success"] and reconcile.get("filled_shares", 0) <= 0:
+                    trade.order_status = reconcile["status"]
+                    trade.order_id = reconcile.get("order_id") or trade.order_id
+                    trade.filled_price = None
+                    trade.filled_shares = 0.0
+                    print("⚠️ Order is still open/unconfirmed after timeout.")
+                    print("   Tracking it so a late fill is not orphaned.")
+                    return True
+
+                print("⚠️ Could not confirm cancel or fill; keeping order under watch.")
+                trade.order_status = reconcile["status"]
+                trade.filled_price = None
+                trade.filled_shares = 0.0
+                return True
             
             print(f"❌ Order not filled: {error_msg}")
             return False
@@ -844,6 +984,124 @@ class ExecutionEngine:
                 print(f"💰 Balance synced: ${self.state.balance:.2f}")
         else:
             print("⚠️ Could not sync balance - using internal tracking")
+
+    def _apply_fill_result_to_trade(self, trade: Trade, fill_result: Dict) -> bool:
+        """Copy a confirmed fill result onto a trade and sync live balance."""
+        filled_shares = float(fill_result.get("filled_shares") or 0)
+        filled_price = float(fill_result.get("filled_price") or 0)
+        if filled_shares <= 0:
+            return False
+
+        trade.order_status = fill_result.get("status", trade.order_status)
+        trade.filled_price = filled_price
+        trade.filled_shares = filled_shares
+        if filled_price > 0:
+            trade.entry_odds = filled_price
+
+        print(f"✅ Order filled: {trade.filled_shares:.2f} shares @ ${trade.entry_odds:.4f}")
+        self._sync_balance_after_trade()
+        return True
+
+    def _reconcile_live_order_for_trade(self, trade: Trade, retries: int = 3) -> Dict:
+        """
+        Reconcile an uncertain live order without assuming it failed.
+
+        Returns a fill_result-like dict. When an order remains open, returns
+        success=True with zero filled shares and an OPEN_* status so the caller
+        can keep tracking it instead of orphaning a possible late fill.
+        """
+        order_id = trade.order_id
+        token_id = trade.token_id
+
+        if order_id:
+            final_check = self.polymarket.get_order_status(order_id)
+            if final_check and not final_check.get("_error"):
+                status = self.polymarket._parse_order_status(final_check)
+                if status in ["FILLED", "MATCHED", "PARTIAL"]:
+                    fill_info = self.polymarket._extract_fill_info(final_check)
+                    if fill_info.get("filled_shares", 0) > 0:
+                        return {
+                            "success": True,
+                            "status": status,
+                            "filled_price": fill_info["filled_price"],
+                            "filled_shares": fill_info["filled_shares"],
+                            "order_id": order_id,
+                            "error": None,
+                        }
+                if status in ["CANCELLED", "CANCELED", "EXPIRED", "REJECTED"]:
+                    return {
+                        "success": False,
+                        "status": status,
+                        "filled_price": 0.0,
+                        "filled_shares": 0.0,
+                        "order_id": order_id,
+                        "error": f"Order {status}",
+                    }
+                if status in ["OPEN", "PENDING", "SUBMITTED", "LIVE"]:
+                    return {
+                        "success": True,
+                        "status": f"{status}_UNFILLED",
+                        "filled_price": 0.0,
+                        "filled_shares": 0.0,
+                        "order_id": order_id,
+                        "error": None,
+                    }
+
+        if token_id:
+            position = self.polymarket._check_position_for_fill(
+                token_id,
+                retries=retries,
+                delay_seconds=3.0,
+            )
+            if position:
+                return {
+                    "success": True,
+                    "status": "FILLED_VIA_POSITION_RECONCILE",
+                    "filled_price": position.get("avg_price", 0.0),
+                    "filled_shares": position.get("size", 0.0),
+                    "order_id": order_id,
+                    "error": None,
+                }
+
+            trade_found = self.polymarket._check_trades_for_fill(token_id)
+            if trade_found:
+                return {
+                    "success": True,
+                    "status": "FILLED_VIA_TRADES_RECONCILE",
+                    "filled_price": trade_found.get("price", 0.0),
+                    "filled_shares": trade_found.get("size", 0.0),
+                    "order_id": order_id,
+                    "error": None,
+                }
+
+            open_orders = self.polymarket.get_open_orders_for_token(token_id)
+            if open_orders:
+                order = open_orders[0]
+                open_order_id = (
+                    order.get("id")
+                    or order.get("orderID")
+                    or order.get("order_id")
+                    or order.get("orderId")
+                    or order_id
+                )
+                status = order.get("status") or order.get("orderStatus") or "OPEN"
+                return {
+                    "success": True,
+                    "status": f"{str(status).upper()}_UNFILLED",
+                    "filled_price": 0.0,
+                    "filled_shares": 0.0,
+                    "order_id": open_order_id,
+                    "error": None,
+                }
+
+        return {
+            "success": False,
+            "status": "UNCONFIRMED_NO_FILL",
+            "filled_price": 0.0,
+            "filled_shares": 0.0,
+            "order_id": order_id,
+            "error": "Could not confirm fill or open order",
+        }
     
     def check_and_resolve_trades(self) -> List[Trade]:
         """
@@ -861,6 +1119,40 @@ class ExecutionEngine:
 
         for trade_id, trade in list(self.state.active_trades.items()):
             time_since_entry = (now - trade.entry_time).total_seconds()
+
+            if not config.TEST_MODE and (trade.filled_shares is None or trade.filled_shares <= 0):
+                reconcile = self._reconcile_live_order_for_trade(trade, retries=1)
+                if reconcile["success"] and reconcile.get("filled_shares", 0) > 0:
+                    self._apply_fill_result_to_trade(trade, reconcile)
+                    self._save_active_trades()
+                elif reconcile["status"] in ["CANCELLED", "CANCELED", "EXPIRED", "REJECTED"]:
+                    print(f"ℹ️ Removing unfilled order {trade.order_id}: {reconcile['status']}")
+                    trade.status = TradeStatus.FAILED
+                    trade.outcome = "NO_FILL"
+                    trade.payout = 0.0
+                    trade.resolution_time = datetime.now(timezone.utc)
+                    trade.balance_before = self.state.resolved_balance
+                    trade.balance_after = self.state.resolved_balance
+                    trade.redemption_status = "N/A"
+                    self.refresh_balance()
+                    resolved_trades.append(trade)
+                    continue
+                elif time_since_entry > 1800 and reconcile["status"] == "UNCONFIRMED_NO_FILL":
+                    print(f"⚠️ Order {trade.order_id} still unconfirmed after 30min; marking no-fill")
+                    trade.status = TradeStatus.FAILED
+                    trade.outcome = "NO_FILL"
+                    trade.payout = 0.0
+                    trade.resolution_time = datetime.now(timezone.utc)
+                    trade.balance_before = self.state.resolved_balance
+                    trade.balance_after = self.state.resolved_balance
+                    trade.redemption_status = "N/A"
+                    self.refresh_balance()
+                    resolved_trades.append(trade)
+                    continue
+                else:
+                    if config.VERBOSE_LOGGING:
+                        print(f"⏳ Order {trade.order_id} not filled yet ({reconcile['status']})")
+                    continue
 
             # Only check resolution after market should have ended
             # 15 min = 900 seconds + 60 seconds buffer for resolution propagation
@@ -886,10 +1178,10 @@ class ExecutionEngine:
                                 self._resolve_trade_with_outcome(trade, outcome)
                                 resolved_trades.append(trade)
                             else:
-                                # Really can't determine - mark as unknown loss
-                                print(f"❌ Could not determine resolution for {trade.trade_id} after 30min")
-                                self._resolve_trade_with_outcome(trade, "UNKNOWN")
-                                resolved_trades.append(trade)
+                                # Still unknown. Keep the trade active instead of
+                                # turning missing resolution data into a booked loss.
+                                print(f"⚠️ Could not determine resolution for {trade.trade_id} after 30min")
+                                print("   Keeping trade active until Polymarket reports a definitive outcome.")
                     else:
                         # Got a definitive resolution
                         self._resolve_trade_with_outcome(trade, outcome)
@@ -953,8 +1245,11 @@ class ExecutionEngine:
                     if not redemption_result.get("needs_manual_redemption"):
                         trade.redemption_status = "REDEEMED"
                         trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                        trade.redemption_tx_hash = redemption_result.get("tx_hash")
+                        trade.redemption_method = redemption_result.get("method")
                         print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} pUSD")
                     else:
+                        trade.redemption_method = redemption_result.get("method")
                         print(f"⚠️ Shares require manual redemption on Polymarket: {trade.filled_shares} shares")
                 else:
                     trade.redemption_status = "FAILED"
@@ -1177,8 +1472,11 @@ class ExecutionEngine:
                     if not redemption_result.get("needs_manual_redemption"):
                         trade.redemption_status = "REDEEMED"
                         trade.redemption_amount = redemption_result.get("amount_usdc", payout)
+                        trade.redemption_tx_hash = redemption_result.get("tx_hash")
+                        trade.redemption_method = redemption_result.get("method")
                         print(f"✅ Shares redeemed: ${trade.redemption_amount:.2f} pUSD")
                     else:
+                        trade.redemption_method = redemption_result.get("method")
                         print(f"⚠️ Shares require manual redemption on Polymarket: {trade.filled_shares} shares")
                 else:
                     trade.redemption_status = "FAILED"
@@ -1231,22 +1529,15 @@ class ExecutionEngine:
                     print(f"⚠️ {self.state.consecutive_losses} consecutive losses - trading will pause")
                     
         else:  # UNKNOWN
-            # Treat unknown as loss for accounting safety
+            # Unknown is not a terminal outcome. Do not mutate accounting,
+            # win/loss counters, streaks, or redemption status based on missing
+            # resolution data.
             trade.outcome = "UNKNOWN"
-            trade.status = TradeStatus.RESOLVED_LOSS
+            trade.status = TradeStatus.EXECUTED
             trade.payout = 0.0
             trade.redemption_status = "UNKNOWN"
-            
-            # CSV Balance Tracking (sequential chain based on resolution order)
-            trade.balance_before = self.state.resolved_balance
-            self.state.resolved_balance -= trade.bet_size
-            trade.balance_after = self.state.resolved_balance
-            
-            self.state.losses += 1
-            self.state.daily_losses += 1
-            self.state.daily_pnl -= trade.bet_size
-            
-            print(f"❓ UNKNOWN: {trade.side} | Assuming loss: ${trade.bet_size:.2f} | Balance: ${self.state.resolved_balance:.2f}")
+            print(f"❓ UNKNOWN: {trade.side} | Resolution unavailable; leaving trade active")
+            return
         
         # Update daily trade counter
         self.state.daily_trades += 1
@@ -1282,7 +1573,11 @@ class ExecutionEngine:
         if result and result.get("needs_manual_redemption"):
             trade.redemption_status = "PENDING_MANUAL"
             trade.redemption_amount = result.get("amount_usdc", 0)
+            trade.redemption_method = result.get("method")
             # Don't log error - manual redemption is expected
+        elif result:
+            trade.redemption_method = result.get("method")
+            trade.redemption_tx_hash = result.get("tx_hash")
         
         return result
     

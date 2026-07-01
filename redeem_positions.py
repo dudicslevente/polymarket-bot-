@@ -60,18 +60,32 @@ def main():
     print("📋 CHECKING POSITIONS")
     print("-"*50)
     
-    positions = client.get_open_positions()
+    positions = client.get_open_positions(for_redemption=True)
     
+    if positions is None:
+        print("\n⚠️ Could not fetch positions from Polymarket Data API.")
+        print("   No redemption transaction was attempted. Please retry in a moment.")
+        return
+
     if not positions:
         print("\n✅ No positions found. Nothing to redeem!")
         return
     
-    # Find winning positions
+    # Find winning positions. The data-api returns curPrice=null for many
+    # resolved markets (e.g. 15-minute Bitcoin Up/Down), so current_price
+    # parses to 0.0 and misses real winners. A true winner needs BOTH:
+    #   - redeemable is True : the market has resolved (NOT just live).
+    #     redeemable=False means unresolved — redeeming it reverts on-chain.
+    #   - current_value > 0.01: the position resolved IN OUR FAVOR.
+    #     Losers are also marked redeemable=True but have value 0.
     winning_positions = []
     for pos in positions:
-        cur_price = pos.get("current_price", 0)
         shares = pos.get("size", 0)
-        if cur_price >= 0.99 and shares > 0:
+        cur_price = pos.get("current_price", 0)
+        cur_value = pos.get("current_value", 0)
+        redeemable = pos.get("redeemable")
+        is_winner = (redeemable is True and cur_value > 0.01) or cur_price >= 0.90
+        if is_winner and shares > 0:
             winning_positions.append(pos)
     
     if not winning_positions:
@@ -88,7 +102,11 @@ def main():
         shares = pos.get("size", 0)
         title = pos.get("title", "Unknown")[:50]
         condition_id = pos.get("condition_id", "N/A")
-        value = shares * 1.0  # Winning shares = $1 each
+        # Use the API's current_value (authoritative mark-to-market) when
+        # available; fall back to shares*price for markets that report a price.
+        cur_value = pos.get("current_value", 0)
+        cur_price = pos.get("current_price", 0)
+        value = cur_value if cur_value > 0 else shares * cur_price
         total_value += value
         
         print(f"  {i}. {title}...")

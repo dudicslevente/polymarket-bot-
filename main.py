@@ -114,7 +114,10 @@ def run_trading_loop(
     print("\n🚀 Starting trading loop...")
     print(f"   Scanning every {config.SCAN_INTERVAL_SECONDS} seconds")
     if not config.TEST_MODE:
-        print(f"   Redemption check every {config.REDEMPTION_CHECK_INTERVAL} seconds")
+        if config.ENABLE_REDEMPTION_IN_TRADING_LOOP:
+            print(f"   Redemption check every {config.REDEMPTION_CHECK_INTERVAL} seconds")
+        else:
+            print("   Redemption sweeps disabled in loop; run redeem_positions.py separately")
     print(f"   Press Ctrl+C to stop\n")
     
     while not _shutdown_requested:
@@ -247,11 +250,16 @@ def run_trading_loop(
             # ─────────────────────────────────────────────────────────────────
             # STEP 6.5: Periodic redemption check (LIVE mode only)
             # ─────────────────────────────────────────────────────────────────
-            if not config.TEST_MODE:
+            if not config.TEST_MODE and config.ENABLE_REDEMPTION_IN_TRADING_LOOP:
                 current_time_epoch = time.time()
                 if current_time_epoch - last_redemption_check >= config.REDEMPTION_CHECK_INTERVAL:
-                    # Check for unredeemed winning positions
-                    execution.check_and_redeem_positions()
+                    if execution.state.active_trades:
+                        if config.VERBOSE_LOGGING:
+                            print("⏳ Skipping redemption sweep while trades are active")
+                    else:
+                        # Check for unredeemed winning positions. This is opt-in
+                        # because on-chain retries can block scans for minutes.
+                        execution.check_and_redeem_positions()
                     last_redemption_check = current_time_epoch
             
             # ─────────────────────────────────────────────────────────────────

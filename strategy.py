@@ -198,8 +198,17 @@ def get_price_for_edge_calculation(
     price_source = getattr(config, 'EDGE_PRICE_SOURCE', 'CLOB').upper()
     
     if price_source == "CLOB":
-        # Use real-time orderbook prices
-        best_bid, best_ask = get_realtime_odds_for_side(market, side, polymarket_client)
+        # Use real-time executable orderbook prices. Do not use quoted Gamma
+        # fallback prices for live edge: fallback prices do not prove there is
+        # sell-side liquidity at the displayed price.
+        side_normalized = "up" if side == "UP" else "down"
+        prices = polymarket_client.get_best_prices(market, side_normalized)
+
+        if prices is None or prices.get("is_fallback", True):
+            return (0.0, "CLOB_UNAVAILABLE")
+
+        best_bid = prices.get("bid", 0)
+        best_ask = prices.get("ask", 0)
         
         # For buying, we care about the ASK price (what we'll actually pay)
         # Using bid would give us a false lower price
@@ -224,7 +233,12 @@ def get_price_for_edge_calculation(
     else:
         # Invalid source - fall back to CLOB with warning
         print(f"⚠️ Invalid EDGE_PRICE_SOURCE '{price_source}', defaulting to CLOB")
-        best_bid, best_ask = get_realtime_odds_for_side(market, side, polymarket_client)
+        side_normalized = "up" if side == "UP" else "down"
+        prices = polymarket_client.get_best_prices(market, side_normalized)
+        if prices is None or prices.get("is_fallback", True):
+            return (0.0, "CLOB_UNAVAILABLE")
+        best_bid = prices.get("bid", 0)
+        best_ask = prices.get("ask", 0)
         market_odds = best_ask if best_ask > 0 else best_bid
         return (market_odds, "CLOB")
 
@@ -337,6 +351,10 @@ def analyze_trade_opportunity(
     market_odds, price_source = get_price_for_edge_calculation(market, bias, polymarket_client)
     
     signal.market_odds = market_odds
+
+    if price_source == "CLOB_UNAVAILABLE":
+        signal.skip_reason = "No executable CLOB liquidity for edge calculation"
+        return signal
     
     if market_odds <= 0 or market_odds >= 1:
         signal.skip_reason = f"Invalid market odds: {market_odds}"

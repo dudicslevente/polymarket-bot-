@@ -263,6 +263,13 @@ CANCEL_UNFILLED_ORDERS: bool = os.getenv("CANCEL_UNFILLED_ORDERS", "true").lower
 # This is a safety net to ensure no winning shares are left unredeemed
 REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "300"))  # 5 minutes
 
+# Automatically run periodic redemption sweeps from the trading loop.
+# The loop skips these sweeps while trades are active, so active market handling
+# is protected while leftover resolved winners are still redeemed automatically.
+ENABLE_REDEMPTION_IN_TRADING_LOOP: bool = (
+    os.getenv("ENABLE_REDEMPTION_IN_TRADING_LOOP", "true").lower() == "true"
+)
+
 # Print every losing position during redemption scans.
 # Disabled by default because old losing positions can make redemption logs very noisy.
 REDEMPTION_VERBOSE_LOSSES: bool = os.getenv("REDEMPTION_VERBOSE_LOSSES", "false").lower() == "true"
@@ -336,6 +343,14 @@ def validate_config() -> bool:
         errors.append("POLYMARKET_SIGNATURE_TYPE must be 0, 1, 2, or 3")
     if POLYMARKET_SIGNATURE_TYPE == 3 and not POLYMARKET_CONFIGURED_FUNDER_ADDRESS:
         errors.append("POLYMARKET_FUNDER_ADDRESS or DEPOSIT_WALLET_ADDRESS is required for signature type 3")
+    try:
+        import py_clob_client_v2  # noqa: F401
+    except ImportError as exc:
+        errors.append(
+            "py_clob_client_v2 is required for live trading "
+            f"(import failed: {exc}). Run: pip install --force-reinstall "
+            "pydantic_core py-clob-client-v2"
+        )
     
     # Print all errors
     for error in errors:
@@ -369,6 +384,8 @@ def print_config_summary():
     print(f"Signature type:       {POLYMARKET_SIGNATURE_TYPE}")
     print(f"Funder address:       {POLYMARKET_FUNDER_ADDRESS or WALLET_ADDRESS or 'N/A'}")
     print(f"Auto-detect sig type: {'yes' if POLYMARKET_AUTO_DETECT_SIGNATURE_TYPE else 'no'}")
+    if not TEST_MODE:
+        print(f"Loop redemption:      {'yes' if ENABLE_REDEMPTION_IN_TRADING_LOOP else 'no'}")
     print(f"Scan interval:        {SCAN_INTERVAL_SECONDS}s")
     print(f"Trade cooldown:       {TRADE_COOLDOWN_SECONDS}s")
     print("="*60 + "\n")

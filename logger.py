@@ -44,7 +44,17 @@ TRADE_LOG_COLUMNS = [
     "outcome",
     "payout",
     "profit_loss",
-    "mode"
+    "mode",
+    "order_id",
+    "order_status",
+    "token_id",
+    "condition_id",
+    "filled_price",
+    "filled_shares",
+    "redemption_status",
+    "redemption_amount",
+    "redemption_method",
+    "redemption_tx_hash"
 ]
 
 
@@ -70,6 +80,32 @@ class TradeLogger:
                 print(f"📝 Created trade log: {self.log_file}")
             except Exception as e:
                 print(f"❌ Failed to create log file: {e}")
+            return
+
+        try:
+            with open(self.log_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                existing_columns = reader.fieldnames or []
+                rows = list(reader)
+
+            missing_columns = [
+                column for column in TRADE_LOG_COLUMNS
+                if column not in existing_columns
+            ]
+            if not missing_columns:
+                return
+
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=TRADE_LOG_COLUMNS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({
+                        column: row.get(column, "")
+                        for column in TRADE_LOG_COLUMNS
+                    })
+            print(f"📝 Updated trade log schema: {self.log_file}")
+        except Exception as e:
+            print(f"❌ Failed to update log file schema: {e}")
     
     def log_trade(self, trade: Trade):
         """
@@ -105,7 +141,17 @@ class TradeLogger:
                 trade.outcome or "PENDING",
                 f"{trade.payout:.2f}",
                 f"{profit_loss:.2f}",
-                trade.mode
+                trade.mode,
+                trade.order_id or "",
+                trade.order_status or "",
+                trade.token_id or "",
+                trade.condition_id or "",
+                f"{trade.filled_price:.4f}" if trade.filled_price is not None else "",
+                f"{trade.filled_shares:.4f}" if trade.filled_shares is not None else "",
+                trade.redemption_status or "",
+                f"{trade.redemption_amount:.2f}" if trade.redemption_amount is not None else "",
+                trade.redemption_method or "",
+                trade.redemption_tx_hash or ""
             ]
             
             with open(self.log_file, 'a', newline='') as f:
